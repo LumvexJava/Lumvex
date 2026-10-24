@@ -98,6 +98,8 @@ public class Spin extends ObjectScript {
 }
 ```
 
+**[Read the Wiki & Step-by-Step Tutorials](https://github.com/LumvexJava/Lumvex/wiki)**
+
 ### Core Concepts (`dev.lumvex.game`)
 
 * **`Game`** — Manages the window and main loop (`addScene`, `setWindowSize`, `setFullscreen`, `setRenderScale`, `start`, `quit`). Render scale adjusts automatically on HiDPI displays.
