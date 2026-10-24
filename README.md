@@ -10,13 +10,12 @@ Under the hood, it runs on Vulkan 1.3 using hardware ray tracing (with some/a lo
 * **Maven:** 3.9+ (optional)
 
 ## Building from Source (how to get started with setting up):
-
+You have to install maven by yourself (https://maven.apache.org/download.cgi)
 ```bash
 mvn package   # Builds target/lumvex-core-1.0.0.jar (+ sources) and copies dependencies to lib/
 mvn install   # Installs the engine into your local Maven repository (~/.m2)
 ```
-You have to install maven by yourself (https://maven.apache.org/download.cgi)
-After following the commands, you should be able to easily integrate the engine into IntelliJ using the pom.xml file (Maven Project):
+After following the commands, you should be able to "add" the engine into IntelliJ using the pom.xml file (Maven Project):
 
 ```xml
 <dependency>
