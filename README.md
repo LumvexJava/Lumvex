@@ -45,8 +45,9 @@ public class Main {
     public static void main(String[] args) throws Exception {
         Game game = new Game("Hello Lumvex");
         game.setWindowSize(1280, 720);
-        game.addScene(new HelloScene()); // restarting the scene creates a fresh instance
-        game.start();                    // non-blocking; runs on its own threads
+        game.addScene(new HelloScene());
+        game.start();                    
+        
     }
 }
 
