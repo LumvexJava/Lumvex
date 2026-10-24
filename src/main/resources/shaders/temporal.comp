@@ -1,0 +1,118 @@
+#version 460
+// Temporal stage of the denoiser, after the a-trous filter, on demodulated illumination. Compiled twice: for the
+// diffuse light, and with LUMVEX_SPECULAR for the specular share (specular.comp's output), whose motion is the
+// reflection's own (stored in the specular guide by raygen).
+//
+// The previous frame's filtered result is reprojected with raygen's motion vectors and blended with this frame's.
+// Newly visible pixels get a stable value right away, which their real samples replace over the next frames. The
+// history is clamped to the 3x3 neighborhood (mean +- gamma * sigma) so that changed lighting leaves no trails.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D pingA;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D pingB;
+// Diffuse: xy prev - cur, z history found, w least weight of the current frame. Specular: the specular guide,
+// x albedo (0: no specular share), yz prev - cur (very negative: no history).
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D motionImage;
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D metaImage;     // x: samples in the raw history
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D prevFiltered;  // rgb: illumination, a: frames
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D curFiltered;
+// The previous frame's meta image: z instance + 1. A tap of another object is not reused, otherwise the bright
+// filtered value of a lamp bulb would be dragged over the surface it uncovers while the camera moves.
+layout(set = 0, binding = 6, rgba32f) uniform readonly image2D prevMeta;
+
+layout(push_constant) uniform Params {
+    uint  source;       // 1: pingA, 2: pingB
+    float alphaMin;     // minimum weight of the current frame, i.e. a history of about 1/alphaMin frames
+    float gamma;        // neighborhood clamp width in standard deviations
+    float trustSamples; // pixels with this many real samples keep their own value
+} pc;
+
+// The filter images are half floats, whose largest value is 65504. A bright highlight on a dark surface, divided by
+// the albedo for filtering, can exceed that; the resulting inf and NaN would spread over the whole kernel and show
+// as a black square. Values are kept finite before they are stored.
+const float HALF_MAX = 60000.0;
+vec4 storable(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), -HALF_MAX, HALF_MAX); }
+
+bool sameSurface(ivec2 q, float instance) { return abs(imageLoad(prevMeta, q).z - instance) < 0.5; }
+
+vec3 fetch(ivec2 q) { return pc.source == 1u ? imageLoad(pingA, q).rgb : imageLoad(pingB, q).rgb; }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(curFiltered);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec3 cur = fetch(p);
+    float instance = imageLoad(metaImage, p).z;
+    vec4 motion = imageLoad(motionImage, p);
+#ifdef LUMVEX_SPECULAR
+    motion = vec4(motion.yz, motion.x > 0.0 && motion.y > -10000.0 ? 1.0 : 0.0, 0.0);
+#endif
+    float count = imageLoad(metaImage, p).x;
+    vec3 outC = cur;
+    float frames = 1.0;
+
+    // w: least weight of the current frame; 1 for glass and mirrors, whose history must not be reused at all.
+    if (motion.z > 0.5 && motion.w < 0.99) {
+        // Catmull-Rom resampling; bilinear would blur a little more every frame. Falls back to bilinear at the
+        // borders and next to empty texels.
+        vec2 pos = vec2(p) + motion.xy;
+        ivec2 b = ivec2(floor(pos));
+        vec2 f = pos - vec2(b);
+        vec4 prev = vec4(0.0);
+        float wSum = 0.0;
+        vec4 wx = vec4(f.x * (-0.5 + f.x * (1.0 - 0.5 * f.x)), 1.0 + f.x * f.x * (-2.5 + 1.5 * f.x),
+                       f.x * (0.5 + f.x * (2.0 - 1.5 * f.x)), f.x * f.x * (-0.5 + 0.5 * f.x));
+        vec4 wy = vec4(f.y * (-0.5 + f.y * (1.0 - 0.5 * f.y)), 1.0 + f.y * f.y * (-2.5 + 1.5 * f.y),
+                       f.y * (0.5 + f.y * (2.0 - 1.5 * f.y)), f.y * f.y * (-0.5 + 0.5 * f.y));
+        bool cr = all(greaterThanEqual(b, ivec2(1))) && all(lessThan(b + 2, size));
+        if (cr) {
+            for (int j = 0; j < 4 && cr; ++j) {
+                for (int i = 0; i < 4; ++i) {
+                    ivec2 q = b + ivec2(i - 1, j - 1);
+                    vec4 s = imageLoad(prevFiltered, q);
+                    if (s.a <= 0.0 || !sameSurface(q, instance)) { cr = false; break; }
+                    prev += s * (wx[i] * wy[j]);
+                }
+            }
+            wSum = cr ? 1.0 : 0.0;
+        }
+        if (!cr) {
+            prev = vec4(0.0);
+            for (int i = 0; i < 4; ++i) {
+                ivec2 q = b + ivec2(i & 1, i >> 1);
+                if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, size))) continue;
+                vec4 s = imageLoad(prevFiltered, q);
+                if (s.a <= 0.0 || !sameSurface(q, instance)) continue;
+                float w = ((i & 1) == 1 ? f.x : 1.0 - f.x) * ((i >> 1) == 1 ? f.y : 1.0 - f.y);
+                prev += s * w;
+                wSum += w;
+            }
+        }
+        if (wSum > 1e-3) {
+            prev /= wSum;
+            // Variance clipping
+            vec3 m1 = vec3(0.0), m2 = vec3(0.0);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    vec3 c = fetch(clamp(p + ivec2(dx, dy), ivec2(0), size - 1));
+                    m1 += c;
+                    m2 += c * c;
+                }
+            }
+            m1 /= 9.0;
+            vec3 sigma = sqrt(max(m2 / 9.0 - m1 * m1, 0.0));
+            // Light is never negative. Catmull-Rom overshoots below 0 next to bright texels, and in dark, noisy
+            // places mean - sigma is below 0 too; such a value was carried on from frame to frame as a black blot
+            // while the camera moved.
+            vec3 h = clamp(max(prev.rgb, vec3(0.0)), max(m1 - pc.gamma * sigma, vec3(0.0)), m1 + pc.gamma * sigma);
+            frames = min(prev.a + 1.0, 1.0 / pc.alphaMin);
+            float alpha = max(1.0 / frames, pc.alphaMin);
+            alpha = max(alpha, clamp(count / pc.trustSamples, 0.0, 1.0));
+            alpha = max(alpha, motion.w);
+            outC = mix(h, cur, alpha);
+        }
+    }
+    imageStore(curFiltered, p, storable(vec4(max(outC, vec3(0.0)), frames)));
+}

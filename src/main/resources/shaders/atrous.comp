@@ -1,0 +1,177 @@
+#version 460
+// Edge-avoiding a-trous wavelet filter, the spatial part of SVGF.
+//
+// Mode 0 estimates the variance: accumulation -> dst (rgb radiance, a variance of the mean).
+// Mode 1 runs one iteration: src -> dst with a 5x5 B3-spline kernel spaced by stepSize.
+//
+// Edges are detected through normals, path distance, albedo and luminance. The luminance tolerance scales with the
+// estimated noise, so the blur fades out as the accumulation converges and the result stays unbiased.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D accumImage;
+layout(set = 0, binding = 1, rgba32f) uniform readonly image2D gNormalDepth;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D gAlbedo;
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D srcImage;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D dstImage;
+layout(set = 0, binding = 5, rgba32f) uniform readonly image2D metaImage;   // x: samples in this pixel's history
+
+layout(push_constant) uniform Params {
+    int   mode;
+    int   stepSize;
+    uint  historyLimit;   // max samples per pixel, 0 = unlimited
+    float sigmaLuminance; // ~4
+    float sigmaNormal;    // exponent, ~128
+    float sigmaDepth;     // relative, ~0.02
+    float sigmaAlbedo;    // ~0.1
+    int   demodulate;     // 1: filter radiance / albedo; composite multiplies the albedo back
+} pc;
+
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// The filter images are half floats, whose largest value is 65504. A bright highlight on a dark surface, divided by
+// the albedo for filtering, can exceed that; the resulting inf and NaN would spread over the whole kernel and show
+// as a black square. Values are kept finite before they are stored.
+const float HALF_MAX = 60000.0;
+vec4 storable(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), -HALF_MAX, HALF_MAX); }
+
+
+// A pixel below this share of its darkest neighbor counts as a dark outlier (see the firefly suppression).
+const float DARK_OUTLIER_RATIO = 0.5;
+
+bool inside(ivec2 p, ivec2 size) { return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size)); }
+// Albedo used for demodulation; must match composite.comp. Sky and black surfaces are not demodulated.
+vec3 demodAlbedo(vec3 a) { return pc.demodulate == 0 || luminance(a) < 1e-3 ? vec3(1.0) : max(a, vec3(0.02)); }
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(accumImage);
+    if (!inside(p, size)) return;
+
+    vec4 ndC = imageLoad(gNormalDepth, p);
+    vec3 nC = ndC.xyz;
+    float zC = ndC.w;
+    vec3 aC = imageLoad(gAlbedo, p).rgb;
+
+    // Variance estimation
+    if (pc.mode == 0) {
+        vec4 acc = imageLoad(accumImage, p);
+        vec3 alb = demodAlbedo(aC);
+        float albL = luminance(alb);
+        acc.rgb /= alb;                                  // illumination
+        acc.a /= albL * albL;                            // approximate second moment of the luminance
+        float l = luminance(acc.rgb);
+        float count = max(imageLoad(metaImage, p).x, 1.0);
+        float variance;
+        if (count >= 4.0) {
+            // Temporal estimate: Var[X] = E[X^2] - E[X]^2; the variance of the mean is Var / N.
+            variance = max(acc.a - l * l, 0.0) / count;
+        } else {
+            // Too few samples: estimate from similar neighbors in a 7x7 window.
+            float s1 = 0.0, s2 = 0.0, wSum = 0.0;
+            for (int dy = -3; dy <= 3; ++dy) {
+                for (int dx = -3; dx <= 3; ++dx) {
+                    ivec2 q = p + ivec2(dx, dy);
+                    if (!inside(q, size)) continue;
+                    vec4 ndQ = imageLoad(gNormalDepth, q);
+                    float w = (zC > 0.0 && ndQ.w > 0.0)
+                        ? pow(max(dot(nC, ndQ.xyz), 0.0), 16.0) * exp(-abs(zC - ndQ.w) / (0.05 * zC + 1e-3))
+                        : float(zC <= 0.0 && ndQ.w <= 0.0);
+                    float lq = luminance(imageLoad(accumImage, q).rgb / demodAlbedo(imageLoad(gAlbedo, q).rgb));
+                    s1 += lq * w; s2 += lq * lq * w; wSum += w;
+                }
+            }
+            float mean = s1 / max(wSum, 1e-6);
+            variance = max(s2 / max(wSum, 1e-6) - mean * mean, 0.0) / count;
+            variance *= 2.0; // spatial estimates under-represent the true per-pixel noise
+        }
+
+        // Firefly suppression on the filter input only; the accumulation stays unbiased. A pixel far brighter
+        // than all of its neighbors is clamped to them. A pixel far darker than all of them - on a dim surface some
+        // pixels stay at almost 0 for a hundred samples - claims a variance of 0, so the luminance stop below would
+        // keep every neighbor out and the dark pixels would grow into black blotches; it gets the spread to its
+        // neighbors as variance instead.
+        vec3 color = acc.rgb;
+        if ((pc.historyLimit == 0u || count < 0.95 * float(pc.historyLimit)) && count < 256.0 && zC > 0.0) {
+            float maxL = 0.0, minL = 1e30;
+            vec3 meanC = vec3(0.0);
+            float cnt = 0.0;
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) continue;
+                    ivec2 q = p + ivec2(dx, dy);
+                    if (!inside(q, size)) continue;
+                    vec4 ndQ = imageLoad(gNormalDepth, q);
+                    // Any surface pixel counts, not only ones with similar normals: at model edges and on
+                    // normal-mapped surfaces few neighbors share the normal, and a firefly outshines them all.
+                    if (ndQ.w <= 0.0) continue;
+                    vec3 cq = imageLoad(accumImage, q).rgb / demodAlbedo(imageLoad(gAlbedo, q).rgb);
+                    maxL = max(maxL, luminance(cq));
+                    minL = min(minL, luminance(cq));
+                    meanC += cq;
+                    cnt += 1.0;
+                }
+            }
+            float limit = maxL * 1.5 + 0.02;
+            if (cnt >= 4.0 && l > limit) {
+                color = mix(meanC / cnt, color * (limit / l), 0.5);
+                variance = max(variance, (l - limit) * (l - limit) / count);
+            } else if (cnt >= 4.0 && l < DARK_OUTLIER_RATIO * minL) {
+                variance = max(variance, (minL - l) * (minL - l));
+            }
+        }
+        imageStore(dstImage, p, storable(vec4(color, variance)));
+        return;
+    }
+
+    // A-trous iteration
+    vec4 center = imageLoad(srcImage, p);
+    if (zC <= 0.0) { // sky
+        imageStore(dstImage, p, center);
+        return;
+    }
+
+    // A light 3x3 blur of the variance makes edge stopping more robust.
+    float varBlur = 0.0, varW = 0.0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(p + ivec2(dx, dy), ivec2(0), size - 1);
+            float k = (dx == 0 ? 0.5 : 0.25) * (dy == 0 ? 0.5 : 0.25);
+            varBlur += imageLoad(srcImage, q).a * k;
+            varW += k;
+        }
+    }
+    float sigmaL = pc.sigmaLuminance * sqrt(max(varBlur / varW, 0.0)) + 1e-5;
+    float lC = luminance(center.rgb);
+
+    const float kernel[3] = float[3](3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+    vec3 colorSum = center.rgb * (kernel[0] * kernel[0]);
+    float varianceSum = center.a * (kernel[0] * kernel[0]) * (kernel[0] * kernel[0]);
+    float weightSum = kernel[0] * kernel[0];
+
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = p + ivec2(dx, dy) * pc.stepSize;
+            if (!inside(q, size)) continue;
+            vec4 ndQ = imageLoad(gNormalDepth, q);
+            if (ndQ.w <= 0.0) continue;
+            vec4 s = imageLoad(srcImage, q);
+            vec3 aQ = imageLoad(gAlbedo, q).rgb;
+
+            float dist = length(vec2(dx, dy)) * float(pc.stepSize);
+            float wN = pow(max(dot(nC, ndQ.xyz), 0.0), pc.sigmaNormal);
+            float wZ = exp(-abs(zC - ndQ.w) / (pc.sigmaDepth * zC * dist + 1e-4));
+            vec3 da = aC - aQ;
+            float wA = exp(-dot(da, da) / (pc.sigmaAlbedo * pc.sigmaAlbedo));
+            float wL = exp(-abs(lC - luminance(s.rgb)) / sigmaL);
+            float h = kernel[abs(dx)] * kernel[abs(dy)];
+            float w = h * wN * wZ * wA * wL;
+
+            colorSum += s.rgb * w;
+            varianceSum += s.a * w * w;
+            weightSum += w;
+        }
+    }
+    imageStore(dstImage, p, storable(vec4(colorSum / weightSum, varianceSum / (weightSum * weightSum))));
+}

@@ -1,0 +1,46 @@
+#version 460
+#include "cache.glsl"
+
+// Resolve pass of the radiance cache, one thread per slot, run between the training pass and the image pass.
+// A trained cell blends this frame's samples into its mean. Its weight is capped to the samples of the last
+// maxFrames frames (fewer near moving objects), so old light fades out at a known rate. A cell that nobody trained
+// for staleFrames frames is freed.
+layout(local_size_x = 256) in;
+
+RADIANCE_CACHE_BUFFER(0, 0)
+
+layout(push_constant) uniform Params {
+    float maxFrames;        // history of a cell, in frames of training
+    float maxFramesDynamic; // the same inside the influence zone of a moving object
+    float maxWeight;        // upper bound of the weight in samples
+    uint  staleFrames;      // untrained frames after which a cell is freed
+};
+
+void main() {
+    uint slot = gl_GlobalInvocationID.x;
+    if (slot >= CACHE_SIZE || cacheKeys[slot] == 0u) return;
+    uint a = 4u * slot;
+    float n = cacheAccum[a + 3u];
+    uint meta = cacheMeta[slot];
+    if (n > 0.0) {
+        vec4 r = cacheResolved[slot];
+        vec3 sum = vec3(cacheAccum[a], cacheAccum[a + 1u], cacheAccum[a + 2u]);
+        float w = r.w + n;
+        float frames = (meta & CACHE_DYNAMIC) != 0u ? maxFramesDynamic : maxFrames;
+        cacheResolved[slot] = vec4((r.rgb * r.w + sum) / w, min(w, min(maxWeight, n * frames)));
+        cacheAccum[a] = 0.0;
+        cacheAccum[a + 1u] = 0.0;
+        cacheAccum[a + 2u] = 0.0;
+        cacheAccum[a + 3u] = 0.0;
+        cacheMeta[slot] = 0u;
+    } else {
+        uint age = (meta & CACHE_AGE_MASK) + 1u;
+        if (age > staleFrames) {
+            cacheKeys[slot] = 0u;
+            cacheResolved[slot] = vec4(0.0);
+            cacheMeta[slot] = 0u;
+        } else {
+            cacheMeta[slot] = age;
+        }
+    }
+}
