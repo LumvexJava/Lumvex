@@ -36,7 +36,7 @@ dependencies { implementation("dev.lumvex:lumvex-core:1.0.0") }
 
 Everything needed to build a game lives in `dev.lumvex.game`. A typical setup consists of a `Scene` for your level, `GameObject` subclasses for entities, scripts for behavior, and a `Canvas` for the HUD.
 
-Here are some scripts to help you getting started:
+Here are some scripts to help you get started:
 
 ```java
 import dev.lumvex.game.*;
