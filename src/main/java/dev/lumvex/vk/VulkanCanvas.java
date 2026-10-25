@@ -30,6 +30,9 @@ public final class VulkanCanvas extends Canvas implements RenderSurface {
     private volatile boolean resized;
     /** Whether Vulkan has shown a frame; until then the canvas paints itself black instead of the system white. */
     private volatile boolean presented;
+    private volatile boolean loading;
+    private volatile boolean startupFailed;
+    private volatile int shaderProgress;
 
     public VulkanCanvas() {
         String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
@@ -44,16 +47,87 @@ public final class VulkanCanvas extends Canvas implements RenderSurface {
         });
     }
 
+    /** Shows the shader loading screen until Vulkan presents its first frame. */
+    public void showShaderLoading() {
+        loading = true;
+        repaint();
+    }
+
+    /** Advances the loading animation by the shader compilation percentage. */
+    @Override
+    public void shaderCompilationProgress(String shader, int percent) {
+        shaderProgress = Math.clamp(percent, 0, 100);
+        repaint();
+    }
+
+    /** Shows a short failure status if renderer initialization fails. */
+    public void showStartupError() {
+        startupFailed = true;
+        repaint();
+    }
+
     // Vulkan owns the pixels once it presents; AWT must not clear or paint them then.
     @Override public void paint(Graphics g) {
         if (presented) return;
-        g.setColor(Color.BLACK);
-        g.fillRect(0, 0, getWidth(), getHeight());
+        if (loading) {
+            paintShaderLoading((Graphics2D) g);
+        } else {
+            g.setColor(Color.BLACK);
+            g.fillRect(0, 0, getWidth(), getHeight());
+        }
     }
 
     @Override public void update(Graphics g) { paint(g); }
 
     @Override public void framePresented() { presented = true; }
+
+    private void paintShaderLoading(Graphics2D graphics) {
+        Graphics2D g = (Graphics2D) graphics.create();
+        try {
+            int width = getWidth(), height = getHeight();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            g.setColor(Color.BLACK);
+            g.fillRect(0, 0, width, height);
+
+            int fontSize = Math.clamp(width / 20, 24, 44);
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, fontSize));
+            FontMetrics metrics = g.getFontMetrics();
+            int tracking = Math.max(2, fontSize / 10);
+            int wordGap = fontSize / 2;
+            int logoWidth = wordWidth("LUMVEX", metrics, tracking) + wordGap
+                    + wordWidth("CORE", metrics, tracking);
+            int x = (width - logoWidth) / 2;
+            int baseline = height / 2;
+            int litLetters = shaderProgress / 10;
+            int letter = 0;
+            for (String word : List.of("LUMVEX", "CORE")) {
+                for (int i = 0; i < word.length(); i++, letter++) {
+                    g.setColor(letter < litLetters ? Color.WHITE : new Color(75, 75, 75));
+                    char character = word.charAt(i);
+                    g.drawString(String.valueOf(character), x, baseline);
+                    x += metrics.charWidth(character) + tracking;
+                }
+                if (word.equals("LUMVEX")) x += wordGap - tracking;
+            }
+
+            if (startupFailed) {
+                g.setFont(new Font(Font.SANS_SERIF, Font.PLAIN, 12));
+                g.setColor(Color.WHITE);
+                drawCentered(g, "STARTUP FAILED", width / 2, baseline + fontSize + 28);
+            }
+        } finally {
+            g.dispose();
+        }
+    }
+
+    private static int wordWidth(String word, FontMetrics metrics, int tracking) {
+        return metrics.stringWidth(word) + tracking * (word.length() - 1);
+    }
+
+    private static void drawCentered(Graphics2D g, String text, int centerX, int baseline) {
+        g.drawString(text, centerX - g.getFontMetrics().stringWidth(text) / 2, baseline);
+    }
 
     @Override
     public List<String> instanceExtensions() {

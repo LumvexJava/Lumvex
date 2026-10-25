@@ -302,6 +302,9 @@ public final class Renderer implements AutoCloseable {
                 + " | SBT handle " + ctx.shaderGroupHandleSize + "B | max recursion " + ctx.maxRayRecursionDepth);
 
         compiler = new ShaderCompiler();
+        // Startup compiles 6 ray-tracing, 1 cache, 5 post-process, and 1 flare module.
+        int expectedShaderCount = 13 + (scene.textureCompression && ctx.textureCompressionBC && VirtualTextures.gpuEncode ? 1 : 0);
+        compiler.setProgressListener(expectedShaderCount, (shader, percent) -> window.shaderCompilationProgress(shader, percent));
         if (ctx.atomicFloatAddSupported) compiler.define("LUMVEX_CACHE", "1");
         else System.err.println("[lumvex] no float atomics on this GPU: speculative rendering disabled");
         if (ctx.invocationReorderSupported && compileSer) compiler.define("LUMVEX_SER", "1");

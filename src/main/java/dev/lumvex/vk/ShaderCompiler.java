@@ -9,8 +9,10 @@ import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.LongBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.function.BiConsumer;
 
 import static dev.lumvex.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
@@ -25,6 +27,9 @@ public final class ShaderCompiler implements AutoCloseable {
 
     private final long compiler;
     private final long options;
+    private BiConsumer<String, Integer> progressListener = (shader, percent) -> { };
+    private int expectedShaderCount;
+    private int compiledShaderCount;
 
     /** Targets Vulkan 1.3 / SPIR-V 1.6 with performance optimizations. */
     public ShaderCompiler() {
@@ -33,6 +38,14 @@ public final class ShaderCompiler implements AutoCloseable {
         shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
         shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_6);
         shaderc_compile_options_set_optimization_level(options, shaderc_optimization_level_performance);
+    }
+
+    /** Reports successful module creation as a percentage of the expected startup shaders. */
+    public void setProgressListener(int expectedShaderCount, BiConsumer<String, Integer> listener) {
+        if (expectedShaderCount <= 0) throw new IllegalArgumentException("expectedShaderCount must be positive");
+        if (compiledShaderCount != 0) throw new IllegalStateException("shader compilation has already started");
+        this.expectedShaderCount = expectedShaderCount;
+        this.progressListener = Objects.requireNonNull(listener, "listener");
     }
 
     /** Adds a macro definition to all subsequent compilations. */
@@ -91,7 +104,12 @@ public final class ShaderCompiler implements AutoCloseable {
                 VkShaderModuleCreateInfo info = VkShaderModuleCreateInfo.calloc(stack).sType$Default().pCode(copy);
                 LongBuffer lp = stack.mallocLong(1);
                 check(vkCreateShaderModule(ctx.device, info, null, lp), "vkCreateShaderModule(" + name + ")");
-                return lp.get(0);
+                long module = lp.get(0);
+                if (expectedShaderCount > 0) {
+                    int percent = Math.min(100, ++compiledShaderCount * 100 / expectedShaderCount);
+                    progressListener.accept(name, percent);
+                }
+                return module;
             } finally {
                 memFree(copy);
             }

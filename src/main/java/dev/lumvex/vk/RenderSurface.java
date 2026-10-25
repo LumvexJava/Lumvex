@@ -23,6 +23,9 @@ public interface RenderSurface {
     /** Called after a frame was handed to the swapchain; the surface no longer needs to paint itself. */
     default void framePresented() { }
 
+    /** Reports startup shader compilation progress; offscreen surfaces may ignore it. */
+    default void shaderCompilationProgress(String shader, int percent) { }
+
     /** Offscreen rendering without a swapchain, e.g. for thumbnails. */
     default boolean headless() { return false; }
 }

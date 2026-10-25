@@ -247,6 +247,7 @@ public final class Game {
                     onStarted.run();
                 },
                 err -> SwingUtilities.invokeLater(() -> {
+                    canvas.showStartupError();
                     if (onError != null) {
                         onError.accept(err);
                     } else {
@@ -300,6 +301,7 @@ public final class Game {
         installInput();
         try { robot = new Robot(); } catch (AWTException ignored) { }
         new Timer(40, e -> syncMouseLock()).start();
+        canvas.showShaderLoading();
         frame.setVisible(true);
         canvas.requestFocusInWindow();
     }
