@@ -8,6 +8,7 @@ Under the hood, it runs on Vulkan 1.3 using hardware ray tracing (with some/a lo
 * **GPU:** Vulkan 1.3 with hardware ray tracing support (NVIDIA RTX or AMD RX 6000+)
 * **Java:** JDK 21 (A full JDK is required if you compile external project scripts at runtime; otherwise a JRE is sufficient)
 * **Maven:** 3.9+ (optional)
+* **OS:** Windows x86-64 or Linux x86-64 with an X11 display (including XWayland); native Wayland surfaces are not supported. Maven selects the matching LWJGL and Jolt native libraries for the build OS.
 
 ## Building from Source (how to get started with setting up):
 You have to install maven by yourself (https://maven.apache.org/download.cgi)

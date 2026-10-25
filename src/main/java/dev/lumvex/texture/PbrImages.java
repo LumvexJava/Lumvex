@@ -133,7 +133,8 @@ public final class PbrImages {
         BufferedImage d = read(diff);
         int size = sizeFor(d, maxSize);
         BufferedImage n = nor != null ? optional(nor) : null;
-        if (n != null && norDx != null) n = flipGreen(n);              // DirectX to OpenGL convention
+        // DirectX to OpenGL convention
+        if (n != null && norDx != null) n = flipGreen(n);
         BufferedImage r, m, o;
         int rc = 0, mc = 0;
         if (arm != null && rough == null) {

@@ -34,7 +34,8 @@ public final class VkContext implements AutoCloseable {
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
             VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-            KHRRayQuery.VK_KHR_RAY_QUERY_EXTENSION_NAME   // visibility rays from compute shaders (lens flares)
+            // visibility rays from compute shaders (lens flares)
+            KHRRayQuery.VK_KHR_RAY_QUERY_EXTENSION_NAME
     );
 
     public final VkInstance instance;

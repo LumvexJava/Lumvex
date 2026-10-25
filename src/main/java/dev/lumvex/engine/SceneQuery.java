@@ -54,7 +54,8 @@ public final class SceneQuery {
             Scene.Instance inst = scene.instances.get(i);
             inst.transform.invert(inv);
             inv.transformPosition(o.set(origin));
-            inv.transformDirection(d.set(dir));                  // left unnormalized so t stays a world distance
+            // left unnormalized so t stays a world distance
+            inv.transformDirection(d.set(dir));
             Mesh m = scene.meshes.get(inst.mesh);
             float[] v = m.vertices;
             int[] idx = m.indices;
@@ -73,7 +74,8 @@ public final class SceneQuery {
             Vector3f e1 = new Vector3f(v[b] - v[a], v[b + 1] - v[a + 1], v[b + 2] - v[a + 2]);
             Vector3f e2 = new Vector3f(v[c] - v[a], v[c + 1] - v[a + 1], v[c + 2] - v[a + 2]);
             Vector3f n = e1.cross(e2);
-            new Matrix3f(inv).transpose().transform(n).normalize();     // normals transform with the inverse transpose
+            // normals transform with the inverse transpose
+            new Matrix3f(inv).transpose().transform(n).normalize();
             if (n.dot(dir) > 0) n.negate();
             best = new Hit(i, bestT, new Vector3f(dir).mul(bestT).add(origin), n);
         }

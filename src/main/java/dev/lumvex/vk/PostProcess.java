@@ -41,12 +41,16 @@ public final class PostProcess implements AutoCloseable {
     private final long atrousLayout, compositeLayout, temporalLayout, specularLayout;
     private final long atrousPipeline, compositePipeline, temporalPipeline, specularPipeline, specularTemporalPipeline;
     private final long[] specularTemporalSet = new long[2];
-    private final long[] specularSetA = new long[2];  // reads specPingA, writes specPingB
-    private final long[] specularSetB = new long[2];  // reads specPingB, writes specPingA
+    // reads specPingA, writes specPingB
+    private final long[] specularSetA = new long[2];
+    // reads specPingB, writes specPingA
+    private final long[] specularSetB = new long[2];
     private final long[] temporalSet = new long[2];
     private final long descriptorPool;
-    private final long[] setA = new long[2];          // reads pingA, writes pingB
-    private final long[] setB = new long[2];          // reads pingB, writes pingA
+    // reads pingA, writes pingB
+    private final long[] setA = new long[2];
+    // reads pingB, writes pingA
+    private final long[] setB = new long[2];
     private final long[] compositeSet = new long[2];
 
     public float sigmaLuminance = 4.0f;
@@ -277,7 +281,8 @@ public final class PostProcess implements AutoCloseable {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, specularPipeline);
         ByteBuffer pc = stack.malloc(SPECULAR_PC_SIZE);
         pc.putInt(16, moved ? 1 : 0);
-        dispatchSpecular(cmd, stack, pc, specularSetA[parity], 0, 1, pixelAngle, width, height);   // writes specPingB
+        // writes specPingB
+        dispatchSpecular(cmd, stack, pc, specularSetA[parity], 0, 1, pixelAngle, width, height);
         for (int i = 0; i < iterations; i++) {
             computeBarrier(cmd, stack);
             dispatchSpecular(cmd, stack, pc, (i & 1) == 0 ? specularSetB[parity] : specularSetA[parity], 1, 1 << i,

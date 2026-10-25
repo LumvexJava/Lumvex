@@ -15,7 +15,6 @@
         <maven.compiler.release>21</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
         <lwjgl.version>3.4.3</lwjgl.version>
-        <lwjgl.natives>natives-windows</lwjgl.natives>
         <joml.version>1.10.9</joml.version>
     </properties>
 
@@ -36,21 +35,6 @@
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-vulkan</artifactId></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId></dependency>
         <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-jawt</artifactId></dependency>
-
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl</artifactId><classifier>${lwjgl.natives}</classifier></dependency>
-        <dependency><groupId>org.lwjgl</groupId><artifactId>lwjgl-shaderc</artifactId><classifier>${lwjgl.natives}</classifier></dependency>
-
-        <dependency>
-            <groupId>com.github.stephengold</groupId>
-            <artifactId>jolt-jni-Windows64</artifactId>
-            <version>6.1.1</version>
-        </dependency>
-        <dependency>
-            <groupId>com.github.stephengold</groupId>
-            <artifactId>jolt-jni-Windows64</artifactId>
-            <version>6.1.1</version>
-            <classifier>ReleaseSp</classifier>
-        </dependency>
 
         <dependency>
             <groupId>org.joml</groupId>
@@ -100,4 +84,77 @@
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <profile>
+            <id>windows-x86_64</id>
+            <activation>
+                <os>
+                    <family>Windows</family>
+                    <arch>amd64</arch>
+                </os>
+            </activation>
+            <properties>
+                <lwjgl.natives>natives-windows</lwjgl.natives>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.lwjgl</groupId>
+                    <artifactId>lwjgl</artifactId>
+                    <classifier>${lwjgl.natives}</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>org.lwjgl</groupId>
+                    <artifactId>lwjgl-shaderc</artifactId>
+                    <classifier>${lwjgl.natives}</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.stephengold</groupId>
+                    <artifactId>jolt-jni-Windows64</artifactId>
+                    <version>6.1.1</version>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.stephengold</groupId>
+                    <artifactId>jolt-jni-Windows64</artifactId>
+                    <version>6.1.1</version>
+                    <classifier>ReleaseSp</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+        <profile>
+            <id>linux-x86_64</id>
+            <activation>
+                <os>
+                    <name>Linux</name>
+                    <arch>amd64</arch>
+                </os>
+            </activation>
+            <properties>
+                <lwjgl.natives>natives-linux</lwjgl.natives>
+            </properties>
+            <dependencies>
+                <dependency>
+                    <groupId>org.lwjgl</groupId>
+                    <artifactId>lwjgl</artifactId>
+                    <classifier>${lwjgl.natives}</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>org.lwjgl</groupId>
+                    <artifactId>lwjgl-shaderc</artifactId>
+                    <classifier>${lwjgl.natives}</classifier>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.stephengold</groupId>
+                    <artifactId>jolt-jni-Linux64</artifactId>
+                    <version>6.1.1</version>
+                </dependency>
+                <dependency>
+                    <groupId>com.github.stephengold</groupId>
+                    <artifactId>jolt-jni-Linux64</artifactId>
+                    <version>6.1.1</version>
+                    <classifier>ReleaseSp</classifier>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>

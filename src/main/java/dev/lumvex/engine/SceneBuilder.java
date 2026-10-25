@@ -19,7 +19,8 @@ import java.util.function.Supplier;
  */
 public final class SceneBuilder {
     private static final Vector3f FLAME_COLOR = new Vector3f(1.0f, 0.55f, 0.22f);
-    private static final Vector3f BULB_COLOR = new Vector3f(1.0f, 0.72f, 0.42f);      // warm incandescent
+    // warm incandescent
+    private static final Vector3f BULB_COLOR = new Vector3f(1.0f, 0.72f, 0.42f);
     private static final int MAX_PREFAB_DEPTH = 8;
 
     // Switches for A/B measurements.
@@ -31,9 +32,12 @@ public final class SceneBuilder {
 
     // Registered once per session; these survive rebuilds.
     private final Map<String, Integer> primitiveMeshes = new HashMap<>();
-    private final Map<String, Integer> partMeshes = new HashMap<>();          // "model#part" -> mesh
-    private final Map<String, Integer> textureSets = new HashMap<>();         // texture asset -> set
-    private final Map<String, Integer> modelTextureBase = new HashMap<>();    // model -> first texture set
+    // "model#part" -> mesh
+    private final Map<String, Integer> partMeshes = new HashMap<>();
+    // texture asset -> set
+    private final Map<String, Integer> textureSets = new HashMap<>();
+    // model -> first texture set
+    private final Map<String, Integer> modelTextureBase = new HashMap<>();
     private int flameMesh = -1;
     private String loadedEnvironment;
     private float loadedEnvironmentSunU = Float.NaN;
@@ -248,7 +252,8 @@ public final class SceneBuilder {
         instanceOwner.clear();
         currentSub = -1;
         subRefs.clear();
-        recenterCache.clear();           // the model file may have changed since the last build
+        // the model file may have changed since the last build
+        recenterCache.clear();
         clusterCache.clear();
         texturesAdded = false;
         materialCache.clear();
@@ -446,7 +451,8 @@ public final class SceneBuilder {
         // Kept relative to the owner, so a transform update only needs the owner's world matrix.
         Matrix4f rel = new Matrix4f(relative).mul(local);
         InstanceRef ref;
-        if (currentSub >= 0) {              // post = (pre * copy)^-1 * rel
+        // post = (pre * copy)^-1 * rel
+        if (currentSub >= 0) {
             Matrix4f post = new Matrix4f(currentPre).mul(currentCopy).invert().mul(rel);
             ref = new InstanceRef(index, rel, new Matrix4f(currentPre), post, currentSub);
         } else {
@@ -481,7 +487,8 @@ public final class SceneBuilder {
             Vector3f s = world.getScale(new Vector3f());
             float sy = Math.max(1e-6f, s.y);
             if (p.shape.equals("sphere")) {
-                float radius = s.y * sz[0];              // the light coincides with the ball
+                // the light coincides with the ball
+                float radius = s.y * sz[0];
                 scene.lights.add(new Scene.SphereLight(world.transformPosition(new Vector3f()), radius, new Vector3f(em),
                         Scene.Shape.SPHERE));
                 entityLights.computeIfAbsent(e.id, k -> new ArrayList<>()).add(new LightRef(scene.lights.size() - 1,
@@ -520,7 +527,8 @@ public final class SceneBuilder {
     private void addLight(Entity e, LightComponent l, Matrix4f world) {
         Vector3f color = new Vector3f(l.color[0], l.color[1], l.color[2]);
         if ("sun".equals(l.kind)) {
-            Vector3f dir = world.transformDirection(new Vector3f(0, 0, 1)).normalize();   // direction towards the sun
+            // direction towards the sun
+            Vector3f dir = world.transformDirection(new Vector3f(0, 0, 1)).normalize();
             scene.sunDirection.set(dir);
             scene.sunColor.set(color);
             scene.sunIntensity = l.intensity;
@@ -579,7 +587,8 @@ public final class SceneBuilder {
             if (nodeMatches(mc.node, model.parts().get(i).nodeName())) partIdx.add(i);
         }
         Matrix4f local = new Matrix4f();
-        if (mc.recenter) {             // cached, since thousands of copies may share the model
+        // cached, since thousands of copies may share the model
+        if (mc.recenter) {
             local.set(recenterCache.computeIfAbsent(mc.model + "|" + mc.node, k -> {
                 Vector3f lo = new Vector3f(Float.MAX_VALUE), hi = new Vector3f(-Float.MAX_VALUE);
                 for (int i : partIdx) bounds(model.parts().get(i).mesh(), lo, hi);
@@ -610,7 +619,8 @@ public final class SceneBuilder {
         int flameMat = cachedMaterial("flame", () -> Material.emissive(FLAME_COLOR.x, FLAME_COLOR.y, FLAME_COLOR.z, 30f)
                 .withFlags(Material.LIGHT_PROXY));
         for (float[] c : clusterCache.computeIfAbsent(card, SceneBuilder::clusters)) {
-            float h = Math.max(c[3], 0.02f / Math.max(scaleY, 1e-4f));      // flame height in model space
+            // flame height in model space
+            float h = Math.max(c[3], 0.02f / Math.max(scaleY, 1e-4f));
             Vector3f center = local.transformPosition(new Vector3f(c[0], c[1], c[2]));
             Matrix4f shape = new Matrix4f().translate(center).scale(h * 0.16f, h * 0.42f, h * 0.16f);
             instance(e, flameMesh, flameMat, world, shape);

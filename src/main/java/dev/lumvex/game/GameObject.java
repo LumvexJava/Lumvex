@@ -71,6 +71,7 @@ public class GameObject {
 
     public boolean hasTag(String tag) { return e.tags != null && e.tags.contains(tag); }
 
+    /** Adds the tag unless the object already has it. */
     public void addTag(String tag) {
         if (e.tags == null) e.tags = new ArrayList<>();
         if (!e.tags.contains(tag)) e.tags.add(tag);
@@ -129,6 +130,7 @@ public class GameObject {
 
     public void setScale(float uniform) { setScale(new Vec3(uniform, uniform, uniform)); }
 
+    /** Returns the object's position after applying its parent transforms. */
     public Vec3 worldPosition() {
         Vector3f t = worldMatrix().getTranslation(new Vector3f());
         return new Vec3(t.x, t.y, t.z);
@@ -194,6 +196,7 @@ public class GameObject {
         r.structureChanged();
     }
 
+    /** Child objects in scene order. */
     public List<GameObject> children() {
         if (rt == null) return Collections.unmodifiableList(children);
         List<GameObject> out = new ArrayList<>();
@@ -228,6 +231,7 @@ public class GameObject {
 
     public List<Component> components() { return Collections.unmodifiableList(components); }
 
+    /** Removes a component if it is attached to this object. */
     public void removeComponent(Component component) {
         if (!components.remove(component)) return;
         e.components.remove(component.data());

@@ -23,7 +23,8 @@ final class LightGrid {
     /** Lights per cell. The 32nd 16-bit slot holds the list length. */
     static final int K = 31;
     static final int MAX_CELLS = 4096;
-    static final int ENTRIES_PER_CELL = 2;            // 32 x 16 bit = 16 words = 2 entries of 8 words
+    // 32 x 16 bit = 16 words = 2 entries of 8 words
+    static final int ENTRIES_PER_CELL = 2;
     /** Fraction of shadow rays that pick a light uniformly, so lights outside the cell lists stay reachable. */
     static final float UNIFORM_SHARE = 0.1f;
     /** Margin around the lights' bounding box in meters. */
@@ -39,7 +40,8 @@ final class LightGrid {
     void write(List<Scene.SphereLight> lights, ByteBuffer lb, int base) {
         int n = lights.size();
         if (n == 0) {
-            lb.putFloat(base + 12, 0f);               // cell size 0 disables the grid
+            // cell size 0 disables the grid
+            lb.putFloat(base + 12, 0f);
             return;
         }
         Vector3f lo = new Vector3f(Float.MAX_VALUE), hi = new Vector3f(-Float.MAX_VALUE);

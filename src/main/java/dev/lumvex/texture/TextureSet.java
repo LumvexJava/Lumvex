@@ -15,9 +15,11 @@ import static org.lwjgl.system.MemoryUtil.memFree;
  */
 public final class TextureSet implements AutoCloseable {
     public static final int TILE = 128;
-    public static final int BORDER = 4;                    // filter margin around each tile in the atlas
-    public static final int SLOT = TILE + 2 * BORDER;      // 136
-    public static final int CHANNELS = 3;                  // albedo, normal, orm
+    /** Filter margin around each tile in the atlas. */
+    public static final int BORDER = 4;
+    public static final int SLOT = TILE + 2 * BORDER;
+    /** Number of maps in each texture set: albedo, normal, and ORM. */
+    public static final int CHANNELS = 3;
     public static final int ALBEDO = 0, NORMAL = 1, ORM = 2;
 
     public final String name;
@@ -102,7 +104,8 @@ public final class TextureSet implements AutoCloseable {
             long row = srcAddr + (long) Math.floorMod(y0 + y, dim) * dim * 4;
             long out = dstAddr + (long) y * SLOT * 4;
             memCopy(row + x0 * 4L, out, first * 4L);
-            for (int done = first; done < SLOT; ) {          // wrapped part; tiny mips may wrap several times
+            // wrapped part; tiny mips may wrap several times
+            for (int done = first; done < SLOT; ) {
                 int n = Math.min(SLOT - done, dim);
                 memCopy(row, out + done * 4L, n * 4L);
                 done += n;
@@ -139,7 +142,8 @@ public final class TextureSet implements AutoCloseable {
                 }
                 int o = (y * dim + x) * 4;
                 if (channel == NORMAL) {
-                    float nx = acc[0] / 2 - 1, ny = acc[1] / 2 - 1, nz = acc[2] / 2 - 1; // mean * 2 - 1
+                    // mean * 2 - 1
+                    float nx = acc[0] / 2 - 1, ny = acc[1] / 2 - 1, nz = acc[2] / 2 - 1;
                     float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
                     if (len < 1e-6f) { nx = 0; ny = 0; nz = 1; len = 1; }
                     dst.put(o, (byte) Math.round((nx / len * 0.5f + 0.5f) * 255));

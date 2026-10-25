@@ -61,10 +61,14 @@ public final class Hull {
         double[][] xz = {{s, 0, s}, {-s, 0, s}, {s, 0, -s}, {-s, 0, -s}};
         double[][] xyyz = {{s, s, 0}, {-s, s, 0}, {s, -s, 0}, {-s, -s, 0}, {0, s, s}, {0, -s, s}, {0, s, -s}, {0, -s, -s}};
         double[][] corners = {{t, t, t}, {-t, t, t}, {t, -t, t}, {t, t, -t}, {-t, -t, t}, {-t, t, -t}, {t, -t, -t}, {-t, -t, -t}};
-        LEVELS.add(axes);                                    // box, 8 corners
-        LEVELS.add(concat(axes, xz));                        // box with beveled vertical edges, 16 corners
-        LEVELS.add(concat(axes, xz, xyyz));                  // 18-DOP
-        LEVELS.add(concat(axes, xz, xyyz, corners));         // 26-DOP
+        // box, 8 corners
+        LEVELS.add(axes);
+        // box with beveled vertical edges, 16 corners
+        LEVELS.add(concat(axes, xz));
+        // 18-DOP
+        LEVELS.add(concat(axes, xz, xyyz));
+        // 26-DOP
+        LEVELS.add(concat(axes, xz, xyyz, corners));
         for (int n : new int[]{40, 56, 80, 112}) LEVELS.add(concat(axes, fibonacci(n)));
     }
 

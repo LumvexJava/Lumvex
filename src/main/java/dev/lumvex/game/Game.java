@@ -60,7 +60,8 @@ public final class Game {
     private final Map<Class<? extends Scene>, String> sceneNames = new LinkedHashMap<>();
     private String startScene, title;
     private boolean fullscreen;
-    private float renderScale = Float.NaN;   // NaN: leave the renderer's default
+    // NaN: leave the renderer's default
+    private float renderScale = Float.NaN;
     private int width = 1600, height = 900;
     private ClassLoader scriptLoader;
     private final List<Class<?>> scriptClasses = new ArrayList<>();
@@ -232,7 +233,8 @@ public final class Game {
         if (projectDir != null) {
             System.out.println("[game] scripts: " + scripts.scripts.size() + " classes" + (scripts.ok ? "" : " - ERRORS " + scripts.problems));
         }
-        System.setProperty("sun.awt.noerasebackground", "true");   // Vulkan paints the whole canvas; avoid AWT flicker
+        // Vulkan paints the whole canvas; avoid AWT flicker
+        System.setProperty("sun.awt.noerasebackground", "true");
         try {
             if (SwingUtilities.isEventDispatchThread()) openWindow();
             else SwingUtilities.invokeAndWait(this::openWindow);
@@ -336,7 +338,8 @@ public final class Game {
                     int x = (int) ((mouseLocked ? canvas.getWidth() / 2 : e.getX()) * sc), y = (int) ((mouseLocked ? canvas.getHeight() / 2 : e.getY()) * sc);
                     render.pick(x, y, (id, depth) -> render.gameInput.clicked(id));
                 }
-                if (SwingUtilities.isRightMouseButton(e)) render.input.look = true;   // scenes without a player camera
+                // scenes without a player camera
+                if (SwingUtilities.isRightMouseButton(e)) render.input.look = true;
             }
 
             @Override public void mouseReleased(MouseEvent e) {

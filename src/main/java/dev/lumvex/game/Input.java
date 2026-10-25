@@ -108,7 +108,8 @@ public final class Input extends SystemScript {
             String n = r.type == BUTTON ? "MOUSE_" + r.name : r.name;
             if (r.type != CLICK) {
                 if (r.down) {
-                    if (!down.add(n)) continue;       // auto-repeat of a held key
+                    // auto-repeat of a held key
+                    if (!down.add(n)) continue;
                     pressed.add(n);
                 } else {
                     if (!down.remove(n)) continue;

@@ -168,8 +168,10 @@ public final class Renderer implements AutoCloseable {
     private volatile int[] uiPending;
     private volatile int uiPendingW, uiPendingH;
     private volatile boolean uiChanged;
-    private int[] pickPending;                 // requested pixel, copied by the next recorded frame
-    private int[] pickCopied;                  // pixel whose value is in pickBuffer once that frame completes
+    // requested pixel, copied by the next recorded frame
+    private int[] pickPending;
+    // pixel whose value is in pickBuffer once that frame completes
+    private int[] pickCopied;
     private Consumer<float[]> pickCallback;
 
     /** Sets the UI overlay as premultiplied ARGB pixels, or null for none. Thread-safe; applied before the next frame. */
@@ -216,7 +218,8 @@ public final class Renderer implements AutoCloseable {
     private void readPick() {
         if (pickCopied == null || pickCallback == null) return;
         ByteBuffer b = pickBuffer.map();
-        float[] r = {b.getFloat(8), b.getFloat(4)};       // meta.z: instance + 1, meta.y: view depth
+        // meta.z: instance + 1, meta.y: view depth
+        float[] r = {b.getFloat(8), b.getFloat(4)};
         pickCopied = null;
         Consumer<float[]> cb = pickCallback;
         pickCallback = null;
@@ -410,7 +413,8 @@ public final class Renderer implements AutoCloseable {
         if (!statsPending) return;
         ByteBuffer b = statsBuffer.map();
         for (int i = 0; i < lastStats.length; i++) {
-            lastStats[i] = Integer.toUnsignedLong(b.getInt(i * 4)) * STAT_WARP_RATE; // only every 16th warp counts
+            // only every 16th warp counts
+            lastStats[i] = Integer.toUnsignedLong(b.getInt(i * 4)) * STAT_WARP_RATE;
             b.putInt(i * 4, 0);
         }
         statsPending = false;
@@ -423,7 +427,8 @@ public final class Renderer implements AutoCloseable {
     public void resetAccumulation() {
         accumulatedFrames = 0;
         historyValid = false;
-        cache.clear(); // the cached light reflects the old settings
+        // the cached light reflects the old settings
+        cache.clear();
     }
 
     /** Whether every pixel has reached the sample limit. */
@@ -467,7 +472,8 @@ public final class Renderer implements AutoCloseable {
             // Meshes replaced in place: free the old buffers and BLAS once the GPU is idle.
             vkDeviceWaitIdle(ctx.device);
             for (int i : scene.replacedMeshes) {
-                if (i >= gpuMeshes.size()) continue;      // not uploaded yet; handled below
+                // not uploaded yet; handled below
+                if (i >= gpuMeshes.size()) continue;
                 GpuMesh old = gpuMeshes.get(i);
                 old.blas.close();
                 old.vertices.close();
@@ -546,7 +552,8 @@ public final class Renderer implements AutoCloseable {
             memSet(lightBuffer.map(), 0);
             realloc = true;
         }
-        if (realloc) {   // the flare pass binds the TLAS and has one entry per light
+        // the flare pass binds the TLAS and has one entry per light
+        if (realloc) {
             if (flare != null) flare.close();
             flare = new LensFlare(ctx, compiler, tlas.handle, lightCapacity + 1);
             if (descriptorSets[0] != 0) post.updateFlareBuffer(flare.buffer);
@@ -947,13 +954,16 @@ public final class Renderer implements AutoCloseable {
                     new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT),
                     new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
                     new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT),
-                    new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),     // specular share
-                    new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT));    // specular albedo, roughness
+                    // specular share
+                    new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
+                    // specular albedo, roughness
+                    new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT));
         }
         for (int p = 0; p < 2; p++) reservoir[p] = new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT);
         for (int p = 0; p < 2; p++) filtered[p] = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
         for (int p = 0; p < 2; p++) specFiltered[p] = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
-        ctx.submitImmediate(c -> {   // alpha 0 marks "no filtered history yet"
+        // alpha 0 marks "no filtered history yet"
+        ctx.submitImmediate(c -> {
             try (MemoryStack st = stackPush()) {
                 VkClearColorValue zero = VkClearColorValue.calloc(st);
                 VkImageSubresourceRange range = VkImageSubresourceRange.calloc(st).aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
@@ -965,11 +975,13 @@ public final class Renderer implements AutoCloseable {
         pingB = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
         specPingA = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
         specPingB = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
-        outputImage = new StorageImage(ctx, fbW, fbH, VK_FORMAT_R8G8B8A8_UNORM);    // visible part only
+        // visible part only
+        outputImage = new StorageImage(ctx, fbW, fbH, VK_FORMAT_R8G8B8A8_UNORM);
         readback = new Buffer(ctx, (long) fbW * fbH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, Buffer.READBACK);
 
         try (MemoryStack stack = stackPush()) {
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(30, stack); // 2 sets x 15 images
+            // 2 sets x 15 images
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(30, stack);
             int i = 0;
             for (int p = 0; p < 2; p++) {
                 PostProcess.HistoryImages cur = history[p], prev = history[1 - p];
@@ -1126,8 +1138,10 @@ public final class Renderer implements AutoCloseable {
             writeLightOptions();
 
             if (animated) {
-                writeTlasInstances(); // the previous frame has finished, so the buffer is free
-                if (dynamicHistory) accumulatedFrames = 0; // history is kept; only influence zones restart
+                // the previous frame has finished, so the buffer is free
+                writeTlasInstances();
+                // history is kept; only influence zones restart
+                if (dynamicHistory) accumulatedFrames = 0;
                 else resetAccumulation();
             }
             long d0 = System.nanoTime();
@@ -1310,7 +1324,8 @@ public final class Renderer implements AutoCloseable {
         post.recordComposite(cmd, stack, shown, fbW, fbH, (float) vW / fbW, (float) vH / fbH, marginX, marginY, exposure, debugMode, source,
                 specularSource, sampleLimit, debugMode == 0 ? flareStrength : 0f);
         w = fbW;
-        h = fbH;            // blit and screenshot use the visible image
+        // blit and screenshot use the visible image
+        h = fbH;
 
         imageBarrier(stack, outputImage.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
                 VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,

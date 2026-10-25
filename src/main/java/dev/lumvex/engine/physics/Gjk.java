@@ -77,7 +77,8 @@ final class Gjk {
                 Vector3f b = s[1], ab = new Vector3f(b).sub(a);
                 if (ab.dot(ao) > 0) d.set(ab).cross(ao).cross(ab);
                 else { n[0] = 1; d.set(ao); }
-                if (d.lengthSquared() < 1e-14f) return true;       // origin lies on the segment
+                // origin lies on the segment
+                if (d.lengthSquared() < 1e-14f) return true;
                 return false;
             }
             case 3 -> {
@@ -119,7 +120,8 @@ final class Gjk {
         Vector3f a = s[0], b = s[1], c = s[2];
         Vector3f ab = new Vector3f(b).sub(a), ac = new Vector3f(c).sub(a);
         Vector3f abc = new Vector3f(ab).cross(ac);
-        if (abc.lengthSquared() < 1e-14f) {                 // degenerate triangle, continue with the edge a-b
+        // degenerate triangle, continue with the edge a-b
+        if (abc.lengthSquared() < 1e-14f) {
             n[0] = 2;
             if (ab.dot(ao) > 0) d.set(ab).cross(ao).cross(ab);
             else { n[0] = 1; d.set(ao); }
@@ -137,7 +139,8 @@ final class Gjk {
             return segment(s, n, d, ao, ab);
         } else {
             float side = abc.dot(ao);
-            if (Math.abs(side) < 1e-9f) return true;          // origin inside the triangle
+            // origin inside the triangle
+            if (Math.abs(side) < 1e-9f) return true;
             if (side > 0) d.set(abc);
             else {
                 // Origin below the triangle: flip the winding so the normal faces it.

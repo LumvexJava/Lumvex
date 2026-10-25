@@ -163,7 +163,8 @@ public final class RtPipeline implements AutoCloseable {
             long raygenSize = align(handleStride, base);
             long missSize = align(2L * handleStride, base);
             long hitSize = align(handleStride, base);
-            long total = 2 * raygenSize + missSize + hitSize + base; // extra room to align the start address
+            // extra room to align the start address
+            long total = 2 * raygenSize + missSize + hitSize + base;
             sbt = new Buffer(ctx, total,
                     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                     Buffer.UPLOAD);

@@ -93,8 +93,10 @@ public final class GltfLoader {
                     int size = PbrImages.sizeFor(albedo, maxTextureSize);
                     sets.add(PbrImages.build(name, size, albedo,
                             norTex >= 0 ? image(root, bin, norTex, imageCache) : null,
-                            mrTex >= 0 ? image(root, bin, mrTex, imageCache) : null, 1,     // roughness in G
-                            mrTex >= 0 ? image(root, bin, mrTex, imageCache) : null, 2,     // metallic in B
+                            // roughness in G
+                            mrTex >= 0 ? image(root, bin, mrTex, imageCache) : null, 1,
+                            // metallic in B
+                            mrTex >= 0 ? image(root, bin, mrTex, imageCache) : null, 2,
                             aoTex >= 0 ? image(root, bin, aoTex, imageCache) : null));
                     setIndex = textureSetBase + sets.size() - 1;
                     setByImages.put(key, setIndex);
@@ -145,7 +147,8 @@ public final class GltfLoader {
         if (node.has("mesh")) {
             JsonNode mesh = root.path("meshes").path(node.path("mesh").asInt());
             for (JsonNode prim : mesh.path("primitives")) {
-                if (prim.path("mode").asInt(4) != 4) continue; // only triangle lists
+                // only triangle lists
+                if (prim.path("mode").asInt(4) != 4) continue;
                 Mesh m = primitive(root, bin, prim, world, node.path("name").asText(""));
                 if (m == null) continue;
                 for (int i = 0; i < m.vertices.length; i += Mesh.FLOATS_PER_VERTEX) {
@@ -180,7 +183,8 @@ public final class GltfLoader {
             v[o + 6] = uv != null ? uv[i * 2] : 0; v[o + 7] = uv != null ? uv[i * 2 + 1] : 0;
         }
         if (nrm == null) smoothNormals(v, idx);
-        if (world.determinant() < 0) {                           // mirrored: restore counter-clockwise winding
+        // mirrored: restore counter-clockwise winding
+        if (world.determinant() < 0) {
             for (int i = 0; i < idx.length; i += 3) { int t = idx[i + 1]; idx[i + 1] = idx[i + 2]; idx[i + 2] = t; }
         }
         return new Mesh(name, v, idx);

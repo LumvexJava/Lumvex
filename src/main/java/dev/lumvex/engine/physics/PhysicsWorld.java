@@ -147,24 +147,33 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
     }
 
     /**
-     * Loads the Jolt native library once per process. The DLL is extracted from the jar into the temp folder, using a
-     * versioned file name so it can be reused by later runs.
+     * Loads the Jolt native library once per process. The platform library is extracted from the jar into the temp
+     * folder, using a versioned file name so it can be reused by later runs.
      */
     private static synchronized void initJolt() throws Exception {
         if (joltReady) return;
-        String res = "/windows/x86-64/com/github/stephengold/joltjni.dll";
+        String os = System.getProperty("os.name").toLowerCase(Locale.ROOT);
+        boolean windows = os.startsWith("windows");
+        boolean linux = os.startsWith("linux");
+        if (!windows && !linux) throw new UnsupportedOperationException("Jolt natives are not configured for " + os);
+
+        String suffix = windows ? ".dll" : ".so";
+        String resource = windows
+                ? "/windows/x86-64/com/github/stephengold/joltjni.dll"
+                : "/linux/x86-64/com/github/stephengold/libjoltjni.so";
+        String fileName = windows ? "joltjni-6.1.1.dll" : "libjoltjni-6.1.1.so";
         Path dir = Path.of(System.getProperty("java.io.tmpdir"), "lumvex-natives");
         Files.createDirectories(dir);
-        Path dll = dir.resolve("joltjni-6.1.1.dll");
-        if (!Files.exists(dll)) {
-            try (InputStream in = PhysicsWorld.class.getResourceAsStream(res)) {
-                if (in == null) throw new IllegalStateException("missing " + res);
-                Path tmp = Files.createTempFile(dir, "jolt", ".dll");
+        Path library = dir.resolve(fileName);
+        if (!Files.exists(library)) {
+            try (InputStream in = PhysicsWorld.class.getResourceAsStream(resource)) {
+                if (in == null) throw new IllegalStateException("missing " + resource);
+                Path tmp = Files.createTempFile(dir, "jolt", suffix);
                 Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
-                Files.move(tmp, dll, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(tmp, library, StandardCopyOption.REPLACE_EXISTING);
             }
         }
-        System.load(dll.toAbsolutePath().toString());
+        System.load(library.toAbsolutePath().toString());
         Jolt.registerDefaultAllocator();
         Jolt.installDefaultAssertCallback();
         Jolt.installDefaultTraceCallback();
@@ -411,7 +420,8 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
             }
         }
         if (system != null && dt > 0 && bodies.values().stream().anyMatch(Body::dynamic)) {
-            float h = Math.min(dt, 1 / 20f);      // a long frame (loading, breakpoint) must not explode the simulation
+            // a long frame (loading, breakpoint) must not explode the simulation
+            float h = Math.min(dt, 1 / 20f);
             system.update(h, Math.max(1, (int) Math.ceil(h * 60)), temp, jobs);
             for (Body b : bodies.values()) {
                 if (!b.dynamic() || b.jolt < 0 || movedClosure.contains(b.id) || !bi.isActive(b.jolt)) continue;
@@ -590,7 +600,8 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                 boolean trigger = a.c.trigger || b.c.trigger;
                 if (touching) {
                     pairs.put(key, trigger);
-                    events.add(new Event(a.owner, b.owner, trigger, true));      // report the entity, not the copy
+                    // report the entity, not the copy
+                    events.add(new Event(a.owner, b.owner, trigger, true));
                 } else {
                     pairs.remove(key);
                     events.add(new Event(a.owner, b.owner, was, false));

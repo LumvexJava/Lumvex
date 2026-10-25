@@ -35,7 +35,8 @@ public final class MeshFactory {
         for (float[] n : normals) {
             Vector3f normal = new Vector3f(n[0], n[1], n[2]);
             Vector3f up = Math.abs(normal.y) > 0.5f ? new Vector3f(0, 0, 1) : new Vector3f(0, 1, 0);
-            Vector3f right = new Vector3f(up).cross(normal);   // (right, up, normal) is right-handed
+            // (right, up, normal) is right-handed
+            Vector3f right = new Vector3f(up).cross(normal);
             Vector3f u = new Vector3f(normal).cross(right);
             Vector3f center = new Vector3f(normal).mul(size).mul(0.5f);
             Vector3f halfRight = new Vector3f(right).mul(size).mul(0.5f);

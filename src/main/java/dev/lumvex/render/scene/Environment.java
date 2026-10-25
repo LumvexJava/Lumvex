@@ -19,7 +19,8 @@ import java.nio.file.Path;
  */
 public final class Environment {
     public final int width, height;
-    public final float[] rgb;               // linear radiance, row-major, 3 floats per texel
+    /** Linear radiance in row-major order, with three floats per texel. */
+    public final float[] rgb;
     public final Vector3f sunDirection = new Vector3f(0, 1, 0);
     public final Vector3f sunColor = new Vector3f(1);
     /** Irradiance of the extracted sun at normal incidence. */
@@ -52,7 +53,8 @@ public final class Environment {
             int p = b.position();
             if (w >= 8 && w < 32768 && b.get(p) == 2 && b.get(p + 1) == 2 && ((b.get(p + 2) << 8 | (b.get(p + 3) & 0xFF)) == w)) {
                 b.position(p + 4);
-                for (int c = 0; c < 4; c++) {                 // new-style RLE, one component at a time
+                // new-style RLE, one component at a time
+                for (int c = 0; c < 4; c++) {
                     int x = 0;
                     while (x < w) {
                         int count = b.get() & 0xFF;
@@ -66,11 +68,13 @@ public final class Environment {
                     }
                 }
             } else {
-                b.get(scan, 0, w * 4);                        // flat RGBE
+                // flat RGBE
+                b.get(scan, 0, w * 4);
             }
             for (int x = 0; x < w; x++) {
                 int e = scan[x * 4 + 3] & 0xFF;
-                float f = e == 0 ? 0 : (float) Math.scalb(1.0, e - 136);  // 2^(e-128) / 256
+                // 2^(e-128) / 256
+                float f = e == 0 ? 0 : (float) Math.scalb(1.0, e - 136);
                 int o = (y * w + x) * 3;
                 out[o] = ((scan[x * 4] & 0xFF) + 0.5f) * f;
                 out[o + 1] = ((scan[x * 4 + 1] & 0xFF) + 0.5f) * f;

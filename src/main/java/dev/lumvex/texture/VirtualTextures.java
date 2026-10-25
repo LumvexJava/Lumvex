@@ -71,31 +71,39 @@ public final class VirtualTextures implements AutoCloseable {
     private final BlockCompression.Encoder[] encoder = new BlockCompression.Encoder[POOLS * CHANNELS];
     public final long sampler;
 
-    public final Buffer pageTable;   // uvec4 per tile: own entry, stand-in entry, stand-in distance, upload frame
-    public final Buffer feedback;    // uint per tile: smallest distance in cm it was needed at, ~0 if not needed
-    private final Buffer feedbackRead; // CPU copy of the last traced frame's feedback, in cached memory
-    public final Buffer setInfo;     // uvec4(slotsPerRow, atlasSize, frame, 0), then uvec4(size, mips, firstTile, 0) per set
+    /** Stores a {@code uvec4} per tile: its entry, stand-in entry, stand-in distance, and upload frame. */
+    public final Buffer pageTable;
+    /** Stores the smallest camera distance in centimeters at which each tile was needed; {@code ~0} means unused. */
+    public final Buffer feedback;
+    // CPU copy of the last traced frame's feedback, in cached memory
+    private final Buffer feedbackRead;
+    /** Stores {@code uvec4(slotsPerRow, atlasSize, frame, 0)}, then {@code uvec4(size, mipCount, firstTile, 0)} per set. */
+    public final Buffer setInfo;
     /** A stand-in is kept while it stays within this factor of the tolerance, so small moves do not flip it. */
     private static final float STAND_IN_HYSTERESIS = 1.25f;
     private final Buffer staging;
 
     private final int totalTiles;
     private final int[] tileSet, tileMip, tileX, tileY;
-    private final int[] tileSlot;                   // tile -> slot in its pool, or -1
+    // tile -> slot in its pool, or -1
+    private final int[] tileSlot;
     private final int[][] slotTile = new int[POOLS][];
     private final long[][] slotLastUsed = new long[POOLS][];
     private final boolean[][] slotPinned = new boolean[POOLS][];
     private long frame;
     // CPU block compression, on demand
-    private final AtomicReferenceArray<ByteBuffer> encoded;   // per tile: all channels, compressed
+    // per tile: all channels, compressed
+    private final AtomicReferenceArray<ByteBuffer> encoded;
     private final boolean[] encodePending;
     private final ExecutorService workers;
     private final int workerCount;
     private final AtomicLong encodeNanos = new AtomicLong(), encodeCount = new AtomicLong();
     private final ConcurrentLinkedQueue<ByteBuffer> freed = new ConcurrentLinkedQueue<>();
-    private volatile int[][] candTile;              // per tile: the most similar tiles of the same mip
+    // per tile: the most similar tiles of the same mip
+    private volatile int[][] candTile;
     private volatile float[][] candDist;
-    private final int[] aliasOf;                    // tile -> stand-in currently in the page table, or -1
+    // tile -> stand-in currently in the page table, or -1
+    private final int[] aliasOf;
     private volatile boolean similarityReady;
     private volatile String similarityStatus = "computing...";
 
@@ -188,7 +196,8 @@ public final class VirtualTextures implements AutoCloseable {
                     .putInt(24 + s * 16, firstTile[s]).putInt(28 + s * 16, 0);
         }
         boolean gpu = this.compress && gpuEncode && compiler != null;
-        if (gpu) uploadBudget = 64;     // with GPU encoding only the raw copy (~220 KB per tile) limits uploads
+        // with GPU encoding only the raw copy (~220 KB per tile) limits uploads
+        if (gpu) uploadBudget = 64;
         // The encoder reads the raw tiles from a compute shader, so the upload buffer is put in VRAM through the BAR.
         staging = new Buffer(ctx, (long) uploadBudget * rawTileBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                 | (gpu ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0), gpu ? Buffer.UPLOAD : Buffer.HOST);
@@ -341,13 +350,15 @@ public final class VirtualTextures implements AutoCloseable {
             int cells = l[1], step = TILE / cells, comps = l[2];
             for (int cy = 0; cy < cells; cy++) for (int cx = 0; cx < cells; cx++) {
                 float[] acc = new float[3];
-                for (int y = 0; y < step; y += 2) for (int x = 0; x < step; x += 2) {   // every other texel suffices
+                // every other texel suffices
+                for (int y = 0; y < step; y += 2) for (int x = 0; x < step; x += 2) {
                     int px = tileX[tile] * TILE + cx * step + x, py = tileY[tile] * TILE + cy * step + y;
                     int i = (py * dim + px) * 4;
                     for (int c = 0; c < comps; c++) acc[c] += (src.get(i + c) & 0xFF) / 255f;
                 }
                 float inv = 1f / ((step / 2) * (step / 2));
-                for (int c = 0; c < comps; c++) fp[o++] = acc[c] * inv * (l[0] == NORMAL ? 2f : 1f); // normals span [-1, 1]
+                // normals span [-1, 1]
+                for (int c = 0; c < comps; c++) fp[o++] = acc[c] * inv * (l[0] == NORMAL ? 2f : 1f);
             }
         }
         return fp;
@@ -426,7 +437,8 @@ public final class VirtualTextures implements AutoCloseable {
      */
     public void update(VkCommandBuffer cmd, MemoryStack stack) {
         frame++;
-        setInfo.map().putInt(8, (int) frame);        // used to fade in freshly uploaded tiles
+        // used to fade in freshly uploaded tiles
+        setInfo.map().putInt(8, (int) frame);
         ByteBuffer fb = feedbackRead.map();
         ByteBuffer pt = pageTable.map();
         List<Integer> missing = new ArrayList<>();
@@ -436,8 +448,9 @@ public final class VirtualTextures implements AutoCloseable {
         float[][] cd = candDist;
         for (int tile = 0; tile < totalTiles; tile++) {
             int dcm = fb.getInt(tile * 4);
-            if (dcm == -1) continue;                    // not needed this frame
-            fb.putInt(tile * 4, -1);                    // mark as consumed
+            if (dcm == -1) continue;
+            // mark as consumed
+            fb.putInt(tile * 4, -1);
             requested++;
             float dist = Integer.toUnsignedLong(dcm) / 100f;
             int pool = poolOf(tileMip[tile]);
@@ -500,7 +513,8 @@ public final class VirtualTextures implements AutoCloseable {
         List<Integer> ready = new ArrayList<>();
         for (int t : missing) {
             if (!compress || gpuEncoder != null || encoded.get(t) != null) ready.add(t);
-            else requestEncode(t);                   // the coarser mip is shown until the worker is done
+            // the coarser mip is shown until the worker is done
+            else requestEncode(t);
             if (ready.size() >= uploadBudget) break;
         }
         int before = evictionsByUpload;
@@ -577,14 +591,16 @@ public final class VirtualTextures implements AutoCloseable {
         long offset = 0, encOffset = 0;
         int count = 0;
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
-        List<long[]> gpuCopies = new ArrayList<>();      // {encoded offset, atlas, x, y}, copied after encoding
+        // {encoded offset, atlas, x, y}, copied after encoding
+        List<long[]> gpuCopies = new ArrayList<>();
         if (gpuEncoder != null) gpuEncoder.begin();
         for (int tile : tiles) {
             if (count >= uploadBudget) break;
-            if (tileSlot[tile] >= 0) continue;              // requested twice
+            if (tileSlot[tile] >= 0) continue;
             int pool = poolOf(tileMip[tile]);
             int slot = findSlot(pool);
-            if (slot < 0) continue;                         // pool full of tiles needed this frame
+            // pool full of tiles needed this frame
+            if (slot < 0) continue;
             if (slotTile[pool][slot] >= 0) { evict(pool, slot, pt); evictionsByUpload++; }
             int sx = (slot % slotsPerRow) * SLOT, sy = (slot / slotsPerRow) * SLOT;
             ByteBuffer enc = compress ? encoded.get(tile) : null;
@@ -618,7 +634,8 @@ public final class VirtualTextures implements AutoCloseable {
             slotLastUsed[pool][slot] = frame;
             slotPinned[pool][slot] = pin;
             pt.putInt(tile * 16, entry(pool, slot));
-            pt.putInt(tile * 16 + 12, (int) frame);     // upload frame, for the fade-in
+            // upload frame, for the fade-in
+            pt.putInt(tile * 16 + 12, (int) frame);
             count++;
         }
         if (!gpuCopies.isEmpty()) {

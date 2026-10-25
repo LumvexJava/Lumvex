@@ -38,8 +38,10 @@ public abstract class Script {
     /** The first object with this name, or null (a warning is logged). */
     protected final GameObject find(String name) { return rt.find(name, true); }
 
+    /** All objects with this name. */
     protected final List<GameObject> findAll(String name) { return rt.findAll(name); }
 
+    /** All objects with this tag. */
     protected final List<GameObject> findByTag(String tag) { return rt.findByTag(tag); }
 
     /** The first object of the given class, e.g. {@code find(Player.class)}, or null. */
@@ -55,6 +57,7 @@ public abstract class Script {
         return out;
     }
 
+    /** All objects in the running scene. */
     protected final List<GameObject> objects() { return rt.objects(); }
 
     /** The player camera, or null if the scene has none. */
@@ -84,10 +87,13 @@ public abstract class Script {
     /** Ends the game. */
     protected final void stopGame() { rt.requestStop(); }
 
+    /** Current keyboard and mouse input state. */
     protected final Input input() { return rt.input; }
 
+    /** Render settings and post-processing controls. */
     protected final Render render() { return rt.render; }
 
+    /** Frame timing and elapsed-time information. */
     protected final Time time() { return rt.time; }
 
     /**
@@ -99,6 +105,7 @@ public abstract class Script {
     /** The canvas of the given class, e.g. {@code ui(Hud.class).score.setText("3")}, or null. */
     protected final <T extends Canvas> T ui(Class<T> type) { return rt.ui(type); }
 
+    /** Ray casts and physics operations for the running scene. */
     protected final Physics physics() { return rt.physics; }
 
     /** Prints the parts to the console, separated by spaces and prefixed with the script and object name. */
@@ -114,6 +121,7 @@ public abstract class Script {
      */
     public final Object call(String event, Object... args) { return rt.call(List.of(this), describe(), event, args); }
 
+    /** Whether this script declares an event with the given name. */
     public final boolean hasEvent(String event) { return ScriptClass.of(getClass()).events.containsKey(event); }
 
     /** "Class @ Object", used in log lines and error messages. */

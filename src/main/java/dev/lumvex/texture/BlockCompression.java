@@ -72,7 +72,8 @@ public final class BlockCompression {
         }
         for (int a = 0; a < channels; a++) for (int b = 0; b < a; b++) cov[a][b] = cov[b][a];
         float[] axis = {1, 1, 1, 1};
-        for (int it = 0; it < 6; it++) {                       // power iteration for the dominant eigenvector
+        // power iteration for the dominant eigenvector
+        for (int it = 0; it < 6; it++) {
             float[] n = new float[4];
             for (int a = 0; a < channels; a++) for (int b = 0; b < channels; b++) n[a] += cov[a][b] * axis[b];
             float len = 0;
@@ -115,7 +116,8 @@ public final class BlockCompression {
         int c0 = to565(hi[0], hi[1], hi[2]), c1 = to565(lo[0], lo[1], lo[2]);
         int indices = 0;
         if (c0 != c1) {
-            if (c0 < c1) { int t = c0; c0 = c1; c1 = t; }         // c0 > c1 selects 4-color mode
+            // c0 > c1 selects 4-color mode
+            if (c0 < c1) { int t = c0; c0 = c1; c1 = t; }
             int[] pal = new int[12];
             from565(c0, pal, 0);
             from565(c1, pal, 3);
@@ -164,8 +166,10 @@ public final class BlockCompression {
         long bits = 0;
         if (mx > mn) {
             for (int i = 0; i < 16; i++) {
-                int j = Math.round((px[i * 4 + channel] - mn) * 7f / (mx - mn));  // 0 = min, 7 = max
-                int index = j == 7 ? 0 : j == 0 ? 1 : 8 - j;                        // BC4 order: e0 = max, e1 = min, then max to min
+                // 0 = min, 7 = max
+                int j = Math.round((px[i * 4 + channel] - mn) * 7f / (mx - mn));
+                // BC4 order: e0 = max, e1 = min, then max to min
+                int index = j == 7 ? 0 : j == 0 ? 1 : 8 - j;
                 bits |= (long) index << (i * 3);
             }
         }
@@ -270,7 +274,8 @@ public final class BlockCompression {
         long lo64 = 0, hi64 = 0;
         int pos = 0;
         long[] w = {0, 0};
-        pos = put(w, pos, 1 << 6, 7);                                   // mode 6
+        // mode 6
+        pos = put(w, pos, 1 << 6, 7);
         for (int c = 0; c < 4; c++) { pos = put(w, pos, q0[c], 7); pos = put(w, pos, q1[c], 7); }
         pos = put(w, pos, q0[4], 1);
         pos = put(w, pos, q1[4], 1);

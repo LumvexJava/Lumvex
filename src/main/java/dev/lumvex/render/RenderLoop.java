@@ -170,7 +170,8 @@ public final class RenderLoop implements Runnable {
             Set<String> moved = runtime.takeMoved();
             if (structure) {
                 rebuilds++;
-                builder.build(d, true);           // soft build: only changed regions restart
+                // soft build: only changed regions restart
+                builder.build(d, true);
                 animated = builder.lastChanged() > 0;
                 updateStats();
             }
