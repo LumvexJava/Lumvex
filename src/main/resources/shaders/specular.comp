@@ -1,0 +1,184 @@
+#version 460
+// Spatial filter of the specular share, apart from the diffuse light (atrous.comp).
+//
+// Reflections blur by their own rule: a GGX lobe of roughness r spreads a reflected point over about 2 r^2 times
+// the reflected ray's length. Seen from the camera that footprint is a radius in pixels, and the filter never blurs
+// further: nothing on mirrors, a few pixels on polished floors, wide on rough metal. Within the footprint the blur
+// stops at luminance edges, with a tolerance from the estimated noise (as in SVGF), so it fades as samples
+// accumulate. A diffuse filter, guided by the surface alone, smeared sharp reflections and kept glossy grain.
+//
+// Mode 0 prepares: specular history -> dst (rgb radiance / specular albedo, a variance of the mean luminance).
+// Mode 1 runs one a-trous iteration with taps spaced by stepSize, skipped where the footprint is smaller than the
+// spacing. The composite multiplies the specular albedo back in.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D specHistory;  // rgb radiance, a reflected-ray length
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D specGuide;    // x specular albedo, w roughness
+layout(set = 0, binding = 2, rgba32f) uniform readonly image2D gNormalDepth; // xyz normal, w path distance (0 sky)
+layout(set = 0, binding = 3, rgba32f) uniform readonly image2D metaImage;    // x: samples in the history
+layout(set = 0, binding = 4, rgba16f) uniform readonly image2D srcImage;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D dstImage;
+
+layout(push_constant) uniform Params {
+    int   mode;
+    int   stepSize;
+    float pixelAngle;    // view angle of one traced pixel, radians
+    float maxRadius;     // largest footprint in pixels
+    uint  moved;         // 1 if the camera moved: the specular history is then at most MOVING_SAMPLES long
+} pc;
+
+const float MIN_ALBEDO = 0.01;          // must match composite.comp
+const float SIGMA_LUMINANCE = 4.0;      // luminance tolerance in standard deviations of the noise
+const float RELATIVE_TOLERANCE = 1.0;   // plus this share of the brighter luminance
+const float MIN_RADIUS = 2.0;
+// Reach while samples are few: NOISE_RADIUS_MAX pixels up to NOISE_SAMPLES, then falling with 1 / sqrt(samples);
+// none on mirrors (below GLOSSY_ROUGHNESS, raygen's GLOSSY_MIS_ROUGHNESS).
+const float NOISE_RADIUS_MAX = 8.0;
+const float NOISE_SAMPLES = 4.0;
+// Specular history while the camera moves; must match raygen's SPECULAR_MOVING_HISTORY.
+const float MOVING_SAMPLES = 4.0;
+const float GLOSSY_ROUGHNESS = 0.02;           // pixels; glossy reflections of nearby things have tiny footprints but grain
+const float HALF_MAX = 60000.0;
+
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec4 storable(vec4 v) { return clamp(mix(v, vec4(0.0), isnan(v)), -HALF_MAX, HALF_MAX); }
+
+bool inside(ivec2 p, ivec2 size) { return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, size)); }
+
+// Rough surfaces keep their specular share in the diffuse light (raygen's SPECULAR_SPLIT_ROUGHNESS); their
+// specular albedo is 0 here.
+bool hasSpecular(vec4 guide) { return guide.x > 0.0; }
+
+vec3 demodulated(ivec2 q) {
+    return imageLoad(specHistory, q).rgb / max(imageLoad(specGuide, q).x, MIN_ALBEDO);
+}
+
+// Reflection footprint in pixels: lobe spread (2 alpha) times reflected-ray length, over the pixel's footprint.
+float footprint(ivec2 p, float viewDistance, float roughness) {
+    float hit = imageLoad(specHistory, p).a;
+    if (viewDistance <= 0.0 || hit <= 0.0 || roughness < 0.02) return 0.0;      // mirrors stay sharp
+    return clamp(2.0 * roughness * roughness * hit / (viewDistance * pc.pixelAngle), MIN_RADIUS, pc.maxRadius);
+}
+
+// Similar surface for the filter: same plane and roughness.
+float geometryWeight(vec4 ndC, vec4 ndQ, float roughness, float roughnessQ, float dist) {
+    float wN = pow(max(dot(ndC.xyz, ndQ.xyz), 0.0), 32.0 / max(roughness, 0.05));   // sharper lobes, stricter
+    float wZ = exp(-abs(ndC.w - ndQ.w) / (0.02 * ndC.w * max(dist, 1.0) + 1e-4));
+    float wR = exp(-abs(roughness - roughnessQ) * 10.0);
+    return wN * wZ * wR;
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(specHistory);
+    if (!inside(p, size)) return;
+    vec4 guideC = imageLoad(specGuide, p);
+    // Like the sky, rough surfaces have nothing to filter here.
+    if (!hasSpecular(guideC)) {
+        imageStore(dstImage, p, vec4(0.0));
+        return;
+    }
+    vec4 ndC = imageLoad(gNormalDepth, p);
+    float roughness = guideC.a;
+
+    if (pc.mode == 0) {
+        // Noise from the spread of similar neighbors in a 3x3 window. Their values are already means over the
+        // history, so the spread is the remaining noise itself and shrinks as samples accumulate.
+        vec3 c = demodulated(p);
+        float s1 = 0.0, s2 = 0.0, wSum = 0.0;
+        if (ndC.w > 0.0) {
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    ivec2 q = p + ivec2(dx, dy);
+                    if (!inside(q, size)) continue;
+                    vec4 ndQ = imageLoad(gNormalDepth, q);
+                    vec4 gQ = imageLoad(specGuide, q);
+                    if (ndQ.w <= 0.0 || !hasSpecular(gQ)) continue;
+                    float w = geometryWeight(ndC, ndQ, roughness, gQ.a, 1.0);
+                    float l = luminance(demodulated(q));
+                    s1 += l * w; s2 += l * l * w; wSum += w;
+                }
+            }
+        }
+        float mean = s1 / max(wSum, 1e-6);
+        float samples = max(imageLoad(metaImage, p).x, 1.0);
+        float variance = max(s2 / max(wSum, 1e-6) - mean * mean, 0.0);
+        // Fireflies: a rare reflection ray that hit a small bright light outshines the pixel's neighbors by far.
+        // On the filter input only, such a pixel is clamped to them (as in atrous.comp); the history stays unbiased.
+        float l = luminance(c);
+        if (ndC.w > 0.0 && l > 0.0) {
+            float maxL = 0.0, cnt = 0.0;
+            vec3 meanC = vec3(0.0);
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    ivec2 q = p + ivec2(dx, dy);
+                    if ((dx == 0 && dy == 0) || !inside(q, size) || imageLoad(gNormalDepth, q).w <= 0.0) continue;
+                    vec3 cq = demodulated(q);
+                    maxL = max(maxL, luminance(cq));
+                    meanC += cq;
+                    cnt += 1.0;
+                }
+            }
+            float limit = maxL * 1.5 + 0.02;
+            if (cnt >= 4.0 && l > limit) {
+                c = mix(meanC / cnt, c * (limit / l), 0.5);
+                variance = max(variance, (l - limit) * (l - limit) / samples);
+            }
+        }
+        imageStore(dstImage, p, storable(vec4(c, variance)));
+        return;
+    }
+
+    vec4 center = imageLoad(srcImage, p);
+    // The footprint is what the lobe blurs anyway. While a reflection has few samples the filter may reach
+    // further: far away the footprint is a pixel or two, while every pixel is as noisy as near by. That reach
+    // follows the history length, which is even across a surface; the measured noise of single pixels is not and
+    // made a reflected tube thick in some places and thin in others. The luminance stop keeps the edges.
+    float samples = max(imageLoad(metaImage, p).x, 1.0);
+    if (pc.moved != 0u) samples = min(samples, MOVING_SAMPLES);
+    float noiseRadius = NOISE_RADIUS_MAX * min(sqrt(NOISE_SAMPLES / samples), 1.0)
+                      * smoothstep(GLOSSY_ROUGHNESS, 0.1, roughness);
+    float radius = max(footprint(p, ndC.w, roughness), noiseRadius);
+    // The 5x5 kernel reaches 2 steps. Each scale fades in as the radius grows past its step, so neighboring
+    // pixels with slightly different radii do not switch a scale on and off (a visible step in the blur).
+    float spacing = float(pc.stepSize);
+    float strength = smoothstep(0.5 * spacing, 1.5 * spacing, radius);
+    if (strength <= 0.0) {
+        imageStore(dstImage, p, center);
+        return;
+    }
+    float sigmaL = SIGMA_LUMINANCE * sqrt(max(center.a, 0.0)) + 1e-5;
+    float lC = luminance(center.rgb);
+
+    const float kernel[3] = float[3](3.0 / 8.0, 1.0 / 4.0, 1.0 / 16.0);
+    float h0 = kernel[0] * kernel[0];
+    vec3 sum = center.rgb * h0;
+    float varianceSum = center.a * h0 * h0;
+    float wSum = h0;
+    for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 q = p + ivec2(dx, dy) * pc.stepSize;
+            if (!inside(q, size)) continue;
+            vec4 ndQ = imageLoad(gNormalDepth, q);
+            vec4 gQ = imageLoad(specGuide, q);
+            if (ndQ.w <= 0.0 || !hasSpecular(gQ)) continue;
+            vec4 s = imageLoad(srcImage, q);
+            float dist = length(vec2(dx, dy)) * float(pc.stepSize);
+            float wD = exp(-0.5 * dist * dist / (radius * radius));
+            // The footprint already bounds the blur to what the lobe blurs anyway, so the luminance stop is mild: a
+            // relative share lets single bright sparks merge into their neighbors.
+            float lQ = luminance(s.rgb);
+            float wL = exp(-abs(lC - lQ) / (sigmaL + RELATIVE_TOLERANCE * max(lC, lQ)));
+            float w = kernel[abs(dx)] * kernel[abs(dy)] * wD * wL
+                    * geometryWeight(ndC, ndQ, roughness, gQ.a, dist);
+            sum += s.rgb * w;
+            varianceSum += s.a * w * w;
+            wSum += w;
+        }
+    }
+    vec4 filtered = vec4(sum / wSum, varianceSum / (wSum * wSum));
+    imageStore(dstImage, p, storable(mix(center, filtered, strength)));
+}

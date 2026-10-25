@@ -1,0 +1,212 @@
+#version 460
+// Final pass: exposure, ACES tone mapping and gamma into the RGBA8 output, plus lens flares and the game UI.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform readonly image2D accumImage;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D pingA;
+layout(set = 0, binding = 2, rgba16f) uniform readonly image2D pingB;
+layout(set = 0, binding = 3, rgba8) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 4, rgba32f) uniform readonly image2D metaImage;  // x: samples in the history
+layout(set = 0, binding = 6, rgba16f) uniform readonly image2D albedoImage; // albedo guide of the denoiser
+layout(set = 0, binding = 7, rgba16f) uniform readonly image2D filteredImage; // temporal stage output
+// Game UI: head = (width, height, enabled, 0), then premultiplied ARGB pixels, row-major.
+layout(set = 0, binding = 8, std430) readonly buffer UiImage { uvec4 uiHead; uint uiPx[]; };
+// The specular share, kept apart from accumImage's diffuse light: raw, or filtered by specular.comp.
+layout(set = 0, binding = 9, rgba32f) uniform readonly image2D specHistory;
+layout(set = 0, binding = 10, rgba16f) uniform readonly image2D specPingA;
+layout(set = 0, binding = 11, rgba16f) uniform readonly image2D specPingB;
+layout(set = 0, binding = 12, rgba16f) uniform readonly image2D specGuide;    // x specular albedo
+layout(set = 0, binding = 13, rgba16f) uniform readonly image2D specFiltered; // temporal stage of the specular share
+
+struct Flare { vec4 source; vec4 color; vec4 state; };                      // see flare.comp
+layout(std430, set = 0, binding = 5) readonly buffer FlareBuffer {
+    mat4 viewProj;
+    vec4 camPos;   // w: number of flares
+    vec4 screen;
+    Flare flares[];
+} fb;
+
+layout(push_constant) uniform Params {
+    float exposure;
+    uint  debugMode;
+    uint  source;      // 0: raw accumulation, 1: pingA, 2: pingB, 3: temporal stage
+    uint  historyLimit;
+    float flareStrength;
+    uint  remodulate;      // 1: the source is illumination, multiply the albedo back in
+    int   marginX;         // overscan border of the traced images
+    int   marginY;         // two ints, since an ivec2 would be 8-byte aligned
+    float scaleX;          // traced pixels per output pixel (the render scale), per axis
+    float scaleY;
+    uint  specSource;      // 0: raw specular history, 1: specPingA, 2: specPingB, 3: specFiltered (demodulated)
+} pc;
+
+float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+vec3 demodAlbedo(vec3 a) { return lum(a) < 1e-3 ? vec3(1.0) : max(a, vec3(0.02)); }   // must match atrous.comp
+
+// ACES filmic tone curve (Narkowicz fit)
+vec3 acesFilm(vec3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
+}
+
+// Lens flares. Lengths are in units of the screen height.
+float hexDist(vec2 q) {             // distance metric of a hexagonal aperture (6 blades)
+    q = abs(q);
+    return max(q.x * 0.866025 + q.y * 0.5, q.y);
+}
+
+float ghostShape(vec2 q, float radius) {   // soft hexagon, brighter towards the rim
+    float hd = hexDist(q);
+    return smoothstep(radius, radius * 0.82, hd) * (0.55 + 0.45 * smoothstep(radius * 0.4, radius, hd));
+}
+
+// Position on the flare axis (0 source, 1 screen center, 2 mirrored), radius, tint times intensity.
+const int GHOSTS = 7;
+const vec2 GHOST_POS_RADIUS[GHOSTS] = vec2[](vec2(0.55, 0.020), vec2(1.30, 0.045), vec2(1.55, 0.012), vec2(1.85, 0.075),
+                                             vec2(2.20, 0.030), vec2(2.60, 0.110), vec2(-0.25, 0.008));
+const vec3 GHOST_TINT[GHOSTS] = vec3[](vec3(0.30, 0.20, 0.08), vec3(0.06, 0.16, 0.10), vec3(0.22, 0.10, 0.30),
+                                       vec3(0.05, 0.07, 0.13), vec3(0.20, 0.12, 0.04), vec3(0.025, 0.04, 0.05),
+                                       vec3(0.35, 0.25, 0.15));
+
+// Below this a flare term is invisible after tone mapping. Every term is bounded before it is evaluated: with
+// dozens of sources, evaluating all of them at every pixel cost more than the denoiser.
+const float FLARE_EPS = 2e-4;
+
+// Glow, starburst, ghosts and halo of every visible source, scaled by its visibility.
+vec3 lensFlares(vec2 p) {
+    vec2 res = fb.screen.xy;
+    float H = res.y;
+    vec2 center = res * 0.5;
+    vec3 sum = vec3(0.0);
+    uint n = uint(fb.camPos.w);
+    for (uint i = 0u; i < n; i++) {
+        vec4 st = fb.flares[i].state;
+        if (st.w < 0.5 || st.z < 0.002) continue;
+        vec2 L = st.xy;
+        // Fade out as the source leaves the frame; the lens still catches light slightly outside.
+        vec2 outside = max(max(-L, L - res), 0.0) / H;
+        vec3 col = fb.flares[i].color.rgb * st.z * exp(-dot(outside, outside) * 40.0) * pc.flareStrength;
+        if (max(col.r, max(col.g, col.b)) < 1e-6) continue;
+
+        vec2 d = (p - L) / H;
+        float r = length(d);
+        // Core and veiling glare
+        float peak = max(col.r, max(col.g, col.b));
+        float glow = 1.5 * exp(-r * r / (0.003 * 0.003)) + 0.05 * exp(-r / 0.018) + 0.006 * exp(-r / 0.10);
+        // Starburst with 6 diffraction spikes that rotate with the screen position; spikes are at most 1.4
+        float starEnvelope = 0.12 * exp(-r / 0.05) / (1.0 + r * 60.0);
+        float star = 0.0;
+        if (peak * starEnvelope * 1.4 > FLARE_EPS) {
+            float rot = 0.6 * (L.x / res.x) + 0.35 * (L.y / res.y) + float(i) * 0.37;
+            float a = atan(d.y, d.x) + rot;
+            star = starEnvelope * (pow(abs(cos(3.0 * a)), 90.0) + 0.4 * pow(abs(cos(3.0 * a + 0.5236)), 160.0));
+        }
+        // Anamorphic streak
+        float streak = 0.025 * exp(-abs(d.y) / 0.0010) * exp(-abs(d.x) / 0.20);
+        sum += col * (glow + star) + col * vec3(0.55, 0.7, 1.0) * streak;
+
+        // Ghosts along the axis through the screen center, with slight chromatic size differences
+        vec2 axis = (center - L) / H;
+        for (int g = 0; g < GHOSTS; g++) {
+            vec2 q = (p - center) / H + axis * (1.0 - GHOST_POS_RADIUS[g].x);   // relative to the ghost
+            float rad = GHOST_POS_RADIUS[g].y * (1.0 + 0.6 * length(axis));      // ghosts grow off-axis
+            // The largest of the three shapes ends at hexDist = 1.08 rad, and hexDist >= 0.866 |q|.
+            if (dot(q, q) * 0.75 > rad * rad * 1.17) continue;
+            vec3 shape = vec3(ghostShape(q, rad), ghostShape(q, rad * 1.04), ghostShape(q, rad * 1.08));
+            sum += col * GHOST_TINT[g] * shape * (0.012 / (rad * 10.0));
+        }
+        // Halo: a faint rainbow ring around the screen center, strongest on the source's side, and only once the
+        // source is well off-center.
+        vec2 pc0 = (p - center) / H;
+        float pr = length(pc0);
+        if (abs(pr - 0.41) > 0.08 || peak * 0.004 < FLARE_EPS) continue;
+        float side = pow(max(dot(pc0 / max(pr, 1e-4), normalize(-axis + 1e-6)), 0.0), 4.0);
+        vec3 ring = exp(-pow((vec3(pr) - vec3(0.40, 0.41, 0.42)) / 0.018, vec3(2.0)));
+        sum += col * mix(vec3(dot(ring, vec3(0.333))), ring, 0.5) * side * 0.004 * smoothstep(0.1, 0.4, length(axis));
+    }
+    return sum;
+}
+
+// Radiance of one traced texel. The albedo is multiplied back in per texel, before any interpolation.
+vec3 radiance(ivec2 r) {
+    r = clamp(r, ivec2(0), imageSize(accumImage) - 1);
+    vec3 c = pc.source == 1u ? imageLoad(pingA, r).rgb
+           : pc.source == 2u ? imageLoad(pingB, r).rgb
+           : pc.source == 3u ? imageLoad(filteredImage, r).rgb
+           : imageLoad(accumImage, r).rgb;
+    if (pc.remodulate != 0u) c *= demodAlbedo(imageLoad(albedoImage, r).rgb);
+    vec3 s = pc.specSource == 0u ? imageLoad(specHistory, r).rgb
+           : (pc.specSource == 1u ? imageLoad(specPingA, r).rgb
+              : pc.specSource == 2u ? imageLoad(specPingB, r).rgb : imageLoad(specFiltered, r).rgb)
+             * max(imageLoad(specGuide, r).x, 0.01);   // must match specular.comp
+#ifdef LUMVEX_SPECULAR_RAW
+    s = imageLoad(specHistory, r).rgb;
+#endif
+    // Experiment switches (LUMVEX_DEFINES): show one share of the light alone.
+#if defined(LUMVEX_SPECULAR_ONLY)
+    return s;
+#elif defined(LUMVEX_DIFFUSE_ONLY)
+    return c;
+#else
+    return c + s;
+#endif
+}
+
+// Radiance at a position in the traced image (texel centers at +0.5). Below a render scale of 1 the image is
+// scaled up with Catmull-Rom, which keeps edges sharp, clamped to the four nearest texels so that it cannot ring.
+vec3 upscaled(vec2 t) {
+    vec2 q = t - 0.5;
+    ivec2 b = ivec2(floor(q));
+    vec2 f = q - vec2(b);
+    vec4 wx = vec4(f.x * (-0.5 + f.x * (1.0 - 0.5 * f.x)), 1.0 + f.x * f.x * (-2.5 + 1.5 * f.x),
+                   f.x * (0.5 + f.x * (2.0 - 1.5 * f.x)), f.x * f.x * (-0.5 + 0.5 * f.x));
+    vec4 wy = vec4(f.y * (-0.5 + f.y * (1.0 - 0.5 * f.y)), 1.0 + f.y * f.y * (-2.5 + 1.5 * f.y),
+                   f.y * (0.5 + f.y * (2.0 - 1.5 * f.y)), f.y * f.y * (-0.5 + 0.5 * f.y));
+    vec3 sum = vec3(0.0), lo = vec3(1e30), hi = vec3(0.0);
+    for (int j = 0; j < 4; j++) {
+        for (int i = 0; i < 4; i++) {
+            vec3 c = radiance(b + ivec2(i - 1, j - 1));
+            sum += c * (wx[i] * wy[j]);
+            if (i == 1 || i == 2) {
+                if (j == 1 || j == 2) { lo = min(lo, c); hi = max(hi, c); }
+            }
+        }
+    }
+    return clamp(sum, lo, hi);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outputImage);
+    if (any(greaterThanEqual(p, size))) return;
+
+    vec2 margin = vec2(pc.marginX, pc.marginY);
+    bool native = pc.scaleX == 1.0 && pc.scaleY == 1.0;
+    vec2 t = (vec2(p) + 0.5) * vec2(pc.scaleX, pc.scaleY) + margin;   // position in the traced images
+    ivec2 r = native ? p + ivec2(margin) : ivec2(t);                    // nearest traced texel, for debug views
+    vec3 c = native ? radiance(r) : upscaled(t);
+    if (pc.flareStrength > 0.0 && pc.debugMode == 0u) c += lensFlares(vec2(p) + 0.5);
+    vec3 mapped;
+    if (pc.debugMode == 4u) { // history length: red = new, green = at the limit
+        float lim = pc.historyLimit == 0u ? 256.0 : float(pc.historyLimit);
+        float t = clamp(imageLoad(metaImage, r).x / lim, 0.0, 1.0);
+        mapped = mix(vec3(0.9, 0.1, 0.05), vec3(0.1, 0.85, 0.2), sqrt(t)) * (0.35 + 0.65 * t);
+    } else if (pc.debugMode == 3u) { // noise estimate (standard deviation of the mean) as a heat map
+        float sd = sqrt(max(pc.source == 2u ? imageLoad(pingB, r).a : imageLoad(pingA, r).a, 0.0)) * 8.0;
+        mapped = clamp(vec3(sd, sd * 0.5, 1.0 - sd) * min(sd * 4.0, 1.0), 0.0, 1.0);
+    } else {
+        mapped = pc.debugMode == 0u ? acesFilm(c * pc.exposure) : clamp(c, 0.0, 1.0);
+    }
+    mapped = pow(mapped, vec3(1.0 / 2.2));
+
+    if (uiHead.z != 0u && p.x < int(uiHead.x) && p.y < int(uiHead.y)) {
+        uint c = uiPx[uint(p.y) * uiHead.x + uint(p.x)];
+        float a = float(c >> 24u) / 255.0;
+        if (a > 0.0) {
+            vec3 rgb = vec3(float((c >> 16u) & 255u), float((c >> 8u) & 255u), float(c & 255u)) / 255.0;
+            mapped = mapped * (1.0 - a) + rgb;          // premultiplied "over"
+        }
+    }
+    imageStore(outputImage, p, vec4(mapped, 1.0));
+}

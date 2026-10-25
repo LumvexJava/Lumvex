@@ -1,0 +1,218 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// Block compression of virtual texture tiles; a port of BlockCompression.java that produces the same bitstream.
+//   BC1         far mips (albedo, ORM)
+//   BC5         normals
+//   BC7 mode 6  near mips (albedo, ORM)
+// One invocation per 4x4 block; gl_WorkGroupID.y selects the job, i.e. one channel of one tile.
+
+layout(local_size_x = 64) in;
+
+struct Job {
+    uint srcWord;    // first texel of the raw channel, in words
+    uint dstWord;    // first output word
+    uint format;     // 0: BC1, 1: BC5, 2: BC7
+    uint width;      // texels per row, a multiple of 4
+};
+layout(set = 0, binding = 0, std430) readonly buffer Raw { uint raw[]; };
+layout(set = 0, binding = 1, std430) writeonly buffer Encoded { uint encoded[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Jobs { Job jobs[]; };
+
+vec4 px[16];
+
+vec4 unpack(uint v) { return vec4(float(v & 255u), float((v >> 8) & 255u), float((v >> 16) & 255u), float(v >> 24)); }
+float jround(float v) { return floor(v + 0.5); }   // matches Java's Math.round
+
+// Extreme points of the block along its principal axis.
+void fitLine(int channels, out vec4 lo, out vec4 hi) {
+    vec4 mask = channels == 3 ? vec4(1, 1, 1, 0) : vec4(1);
+    vec4 mean = vec4(0.0);
+    for (int i = 0; i < 16; i++) mean += px[i];
+    mean = mean / 16.0 * mask;
+    mat4 cov = mat4(0.0);
+    for (int i = 0; i < 16; i++) {
+        vec4 d = (px[i] - mean) * mask;
+        cov += outerProduct(d, d);
+    }
+    vec4 axis = vec4(1.0) * mask;
+    for (int it = 0; it < 6; it++) {                  // power iteration for the dominant eigenvector
+        vec4 n = cov * axis;
+        float len = dot(n, n);
+        if (len < 1e-12) break;
+        axis = n * inversesqrt(len);
+    }
+    float tMin = 1e30, tMax = -1e30;
+    for (int i = 0; i < 16; i++) {
+        float t = dot((px[i] - mean) * mask, axis);
+        tMin = min(tMin, t);
+        tMax = max(tMax, t);
+    }
+    lo = clamp(mean + axis * tMin, 0.0, 255.0);
+    hi = clamp(mean + axis * tMax, 0.0, 255.0);
+}
+
+// BC1
+uint to565(vec3 c) {
+    uint r = uint(jround(c.r * 31.0 / 255.0)), g = uint(jround(c.g * 63.0 / 255.0)), b = uint(jround(c.b * 31.0 / 255.0));
+    return (r << 11) | (g << 5) | b;
+}
+// Expands RGB565 to 8 bits per channel by bit replication.
+ivec3 from565(uint c) {
+    int r = int((c >> 11) & 31u), g = int((c >> 5) & 63u), b = int(c & 31u);
+    return ivec3((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2));
+}
+void bc1(uint dst) {
+    vec4 lo, hi;
+    fitLine(3, lo, hi);
+    uint c0 = to565(hi.rgb), c1 = to565(lo.rgb);
+    uint indices = 0u;
+    if (c0 != c1) {
+        if (c0 < c1) { uint t = c0; c0 = c1; c1 = t; }   // c0 > c1 selects 4-color mode
+        ivec3 pal[4];
+        pal[0] = from565(c0);
+        pal[1] = from565(c1);
+        pal[2] = (2 * pal[0] + pal[1]) / 3;
+        pal[3] = (pal[0] + 2 * pal[1]) / 3;
+        for (int i = 0; i < 16; i++) {
+            ivec3 p = ivec3(px[i].rgb);
+            int best = 0, bestErr = 0x7fffffff;
+            for (int k = 0; k < 4; k++) {
+                ivec3 d = p - pal[k];
+                int e = d.x * d.x + d.y * d.y + d.z * d.z;
+                if (e < bestErr) { bestErr = e; best = k; }
+            }
+            indices |= uint(best) << (i * 2);
+        }
+    }
+    encoded[dst] = c0 | (c1 << 16);
+    encoded[dst + 1u] = indices;
+}
+
+// BC4 / BC5
+uvec2 bc4(int channel) {
+    int mn = 255, mx = 0;
+    for (int i = 0; i < 16; i++) { int v = int(px[i][channel]); mn = min(mn, v); mx = max(mx, v); }
+    uint64_t bits = 0ul;
+    if (mx > mn) {
+        for (int i = 0; i < 16; i++) {
+            int j = int(jround((px[i][channel] - float(mn)) * 7.0 / float(mx - mn)));   // 0 = min, 7 = max
+            int index = j == 7 ? 0 : j == 0 ? 1 : 8 - j;                                  // BC4 order: e0 = max, e1 = min
+            bits |= uint64_t(index) << (i * 3);
+        }
+    }
+    uint64_t block = uint64_t(mx) | (uint64_t(mn) << 8) | (bits << 16);
+    return uvec2(uint(block & 0xFFFFFFFFul), uint(block >> 32));
+}
+void bc5(uint dst) {
+    uvec2 x = bc4(0), y = bc4(1);
+    encoded[dst] = x.x; encoded[dst + 1u] = x.y;
+    encoded[dst + 2u] = y.x; encoded[dst + 3u] = y.y;
+}
+
+// BC7 mode 6
+const int W4[16] = int[16](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+
+// Quantizes an endpoint to 7 bits per channel plus the shared p-bit with the smaller error.
+ivec4 quantize76(vec4 e, out int p) {
+    ivec4 best = ivec4(0);
+    float bestErr = 1e30;
+    p = 0;
+    for (int pb = 0; pb < 2; pb++) {
+        ivec4 q = ivec4(clamp(floor((e - float(pb)) / 2.0 + 0.5), 0.0, 127.0));
+        vec4 d = vec4(q * 2 + pb) - e;
+        float err = dot(d, d);
+        if (err < bestErr) { bestErr = err; best = q; p = pb; }
+    }
+    return best;
+}
+
+// Assigns each texel the nearest of the 16 colors and returns the total squared error.
+int bc7Indices(ivec4 e0, ivec4 e1, inout int idx[16]) {
+    ivec4 pal[16];
+    for (int k = 0; k < 16; k++) pal[k] = (e0 * (64 - W4[k]) + e1 * W4[k] + 32) >> 6;
+    int total = 0;
+    for (int i = 0; i < 16; i++) {
+        ivec4 p = ivec4(px[i]);
+        int best = 0, bestErr = 0x7fffffff;
+        for (int k = 0; k < 16; k++) {
+            ivec4 d = p - pal[k];
+            int e = d.x * d.x + d.y * d.y + d.z * d.z + d.w * d.w;
+            if (e < bestErr) { bestErr = e; best = k; }
+        }
+        idx[i] = best;
+        total += bestErr;
+    }
+    return total;
+}
+
+uint64_t gLo, gHi;
+// Writes `bits` bits at `pos` of the 128-bit block and returns the next position.
+int put(int pos, int value, int bits) {
+    for (int b = 0; b < bits; b++, pos++) {
+        if (((value >> b) & 1) != 0) {
+            if (pos < 64) gLo |= 1ul << pos; else gHi |= 1ul << (pos - 64);
+        }
+    }
+    return pos;
+}
+
+void bc7(uint dst) {
+    vec4 lo, hi;
+    fitLine(4, lo, hi);
+    int p0, p1;
+    ivec4 q0 = quantize76(lo, p0), q1 = quantize76(hi, p1);
+    int idx[16];
+    int err = bc7Indices(q0 * 2 + p0, q1 * 2 + p1, idx);
+
+    // One least-squares refinement of the endpoints for the chosen indices.
+    float aa = 0.0, ab = 0.0, bb = 0.0;
+    vec4 ax = vec4(0.0), bx = vec4(0.0);
+    for (int i = 0; i < 16; i++) {
+        float t = float(W4[idx[i]]) / 64.0, s = 1.0 - t;
+        aa += s * s; ab += s * t; bb += t * t;
+        ax += s * px[i]; bx += t * px[i];
+    }
+    float det = aa * bb - ab * ab;
+    if (abs(det) > 1e-6) {
+        vec4 n0 = clamp((ax * bb - bx * ab) / det, 0.0, 255.0);
+        vec4 n1 = clamp((bx * aa - ax * ab) / det, 0.0, 255.0);
+        int r0p, r1p;
+        ivec4 r0 = quantize76(n0, r0p), r1 = quantize76(n1, r1p);
+        int idx2[16];
+        int err2 = bc7Indices(r0 * 2 + r0p, r1 * 2 + r1p, idx2);
+        if (err2 < err) { q0 = r0; q1 = r1; p0 = r0p; p1 = r1p; idx = idx2; }
+    }
+    // The anchor index is stored with 3 bits, so its top bit must be 0; swap the endpoints if needed.
+    if (idx[0] >= 8) {
+        ivec4 t = q0; q0 = q1; q1 = t;
+        int tp = p0; p0 = p1; p1 = tp;
+        for (int i = 0; i < 16; i++) idx[i] = 15 - idx[i];
+    }
+    gLo = 0ul; gHi = 0ul;
+    int pos = put(0, 1 << 6, 7);                          // mode 6
+    for (int c = 0; c < 4; c++) { pos = put(pos, q0[c], 7); pos = put(pos, q1[c], 7); }
+    pos = put(pos, p0, 1);
+    pos = put(pos, p1, 1);
+    pos = put(pos, idx[0], 3);
+    for (int i = 1; i < 16; i++) pos = put(pos, idx[i], 4);
+    encoded[dst] = uint(gLo & 0xFFFFFFFFul); encoded[dst + 1u] = uint(gLo >> 32);
+    encoded[dst + 2u] = uint(gHi & 0xFFFFFFFFul); encoded[dst + 3u] = uint(gHi >> 32);
+}
+
+void main() {
+    Job job = jobs[gl_WorkGroupID.y];
+    uint bw = job.width / 4u;
+    uint block = gl_GlobalInvocationID.x;
+    if (block >= bw * bw) return;
+    uint bx = block % bw, by = block / bw;
+    for (uint y = 0u; y < 4u; y++) {
+        for (uint x = 0u; x < 4u; x++) {
+            px[y * 4u + x] = unpack(raw[job.srcWord + (by * 4u + y) * job.width + bx * 4u + x]);
+        }
+    }
+    uint words = job.format == 0u ? 2u : 4u;
+    uint dst = job.dstWord + block * words;
+    if (job.format == 0u) bc1(dst);
+    else if (job.format == 1u) bc5(dst);
+    else bc7(dst);
+}

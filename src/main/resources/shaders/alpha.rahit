@@ -1,0 +1,38 @@
+#version 460
+// Any-hit shader for cutout materials such as leaves. The texture set's 1-bit alpha mask decides whether the ray
+// hits. Only cutout instances run it; all others are flagged opaque.
+#include "common.glsl"
+
+hitAttributeEXT vec2 attribs;
+
+layout(buffer_reference, scalar) readonly buffer Vertices { float v[]; }; // pos, normal, uv
+layout(buffer_reference, scalar) readonly buffer Indices { uint i[]; };
+
+layout(set = 0, binding = 3, scalar) readonly buffer InstanceBuffer { InstanceInfo instances[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer MaterialBuffer { Material materials[]; };
+// Per texture set (word offset, side) or (0xFFFFFFFF, 0), then the mask bits, row-major, 1 = solid.
+layout(set = 0, binding = 25, std430) readonly buffer AlphaMasks { uint alphaWords[]; };
+
+const uint VERTEX_FLOATS = 8u;
+const uint MATERIAL_ALPHA_TEST = 2u;
+
+vec2 fetchUV(Vertices vb, uint idx) { uint o = VERTEX_FLOATS * idx; return vec2(vb.v[o + 6], vb.v[o + 7]); }
+
+void main() {
+    InstanceInfo inst = instances[gl_InstanceCustomIndexEXT];
+    Material m = materials[inst.materialIndex];
+    if ((m.flags & MATERIAL_ALPHA_TEST) == 0u || m.textureSet < 0) return;
+    uint offset = alphaWords[2u * uint(m.textureSet)];
+    uint side = alphaWords[2u * uint(m.textureSet) + 1u];
+    if (offset == 0xFFFFFFFFu || side == 0u) return;
+
+    Vertices vb = Vertices(inst.vertexAddress);
+    Indices ib = Indices(inst.indexAddress);
+    uint base = 3u * uint(gl_PrimitiveID);
+    vec2 t0 = fetchUV(vb, ib.i[base]), t1 = fetchUV(vb, ib.i[base + 1u]), t2 = fetchUV(vb, ib.i[base + 2u]);
+    vec3 bary = vec3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
+    vec2 uv = fract((t0 * bary.x + t1 * bary.y + t2 * bary.z) * m.uvScale);
+    uvec2 p = min(uvec2(uv * float(side)), uvec2(side - 1u));
+    uint bit = p.y * side + p.x;
+    if ((alphaWords[offset + (bit >> 5u)] & (1u << (bit & 31u))) == 0u) ignoreIntersectionEXT;
+}
