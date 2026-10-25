@@ -4,6 +4,11 @@ Lumvex Core is a real-time rendering „engine“ written in Java. It has no UI 
 
 Under the hood, it runs on Vulkan 1.3 using hardware ray tracing (with some/a lot of bugs), Jolt for physics, and shaderc to compile GLSL shaders at startup.
 
+<img width="320" height="180" alt="01-autumn-atrium" src="https://github.com/user-attachments/assets/08faf122-6c93-4fab-8e70-179b9a175ba3" />
+<img width="320" height="180" alt="02-neon-reflections" src="https://github.com/user-attachments/assets/9421af78-d211-432f-8757-2179b23d85be" />
+<img width="320" height="180" alt="03-material-studies" src="https://github.com/user-attachments/assets/5d0193f6-245a-49d2-94bf-2df4887dddc7" />
+
+
 ## Requirements (I´m sorry but I´m not 100% sure about the gpu support on AMD Side)
 * **GPU:** Vulkan 1.3 with hardware ray tracing support (NVIDIA RTX or AMD RX 6000+)
 * **Java:** JDK 21 (A full JDK is required if you compile external project scripts at runtime; otherwise a JRE is sufficient)
