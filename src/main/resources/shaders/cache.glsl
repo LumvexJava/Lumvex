@@ -8,7 +8,7 @@
 #ifndef LUMVEX_CACHE_GLSL
 #define LUMVEX_CACHE_GLSL
 
-const uint CACHE_SIZE = 1u << 20;       // slots; must match RadianceCache.SLOTS
+const uint CACHE_SIZE = 1u << 23;       // slots; must match RadianceCache.SLOTS
 const uint CACHE_AGE_MASK = 0xffffu;    // cacheMeta: frames since the cell was last trained
 const uint CACHE_DYNAMIC = 0x80000000u; // cacheMeta: trained inside the influence zone of a moving object this frame
 

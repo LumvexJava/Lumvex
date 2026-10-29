@@ -20,6 +20,11 @@ public final class StorageImage implements AutoCloseable {
     public final int height;
 
     public StorageImage(VkContext ctx, int width, int height, int format) {
+        this(ctx, width, height, format, 0);
+    }
+
+    /** {@code extraUsage}: usage flags beyond storage and transfer, e.g. color attachment for a raster target. */
+    public StorageImage(VkContext ctx, int width, int height, int format, int extraUsage) {
         this.ctx = ctx;
         this.width = width;
         this.height = height;
@@ -34,7 +39,7 @@ public final class StorageImage implements AutoCloseable {
                     .arrayLayers(1)
                     .samples(VK_SAMPLE_COUNT_1_BIT)
                     .tiling(VK_IMAGE_TILING_OPTIMAL)
-                    .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)
+                    .usage(VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsage)
                     .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
                     .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED);
             info.extent().set(width, height, 1);

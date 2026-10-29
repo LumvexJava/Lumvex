@@ -17,7 +17,9 @@ layout(set = 0, binding = 9, rgba32f) uniform readonly image2D specHistory;
 layout(set = 0, binding = 10, rgba16f) uniform readonly image2D specPingA;
 layout(set = 0, binding = 11, rgba16f) uniform readonly image2D specPingB;
 layout(set = 0, binding = 12, rgba16f) uniform readonly image2D specGuide;    // x specular albedo
-layout(set = 0, binding = 13, rgba16f) uniform readonly image2D specFiltered; // temporal stage of the specular share
+layout(set = 0, binding = 13, rgba16f) uniform readonly image2D specFiltered;
+
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D guideND; // temporal stage of the specular share
 
 struct Flare { vec4 source; vec4 color; vec4 state; };                      // see flare.comp
 layout(std430, set = 0, binding = 5) readonly buffer FlareBuffer {
@@ -39,6 +41,12 @@ layout(push_constant) uniform Params {
     float scaleX;          // traced pixels per output pixel (the render scale), per axis
     float scaleY;
     uint  specSource;      // 0: raw specular history, 1: specPingA, 2: specPingB, 3: specFiltered (demodulated)
+    uint  pad0;
+    vec4  hazeColor;       // rgb: in-scattered sky light, w: extinction per meter at height 0 (0: no haze)
+    vec4  hazeSun;         // rgb: sun radiance times its scattering share, w: height falloff per meter
+    vec4  sunDir;          // xyz: towards the sun, w: camera height
+    vec4  camForward;      // xyz: view direction of the image center
+    vec4  camRight;        // xyz: right, scaled to the image edge (tan of half the horizontal field of view)
 } pc;
 
 float lum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -128,6 +136,26 @@ vec3 lensFlares(vec2 p) {
     return sum;
 }
 
+// Aerial perspective (exponential height fog). Optical depth along the ray from the camera at height h0, over the
+// distance d with vertical direction component dy: integral of a exp(-b (h0 + t dy)) dt. The in-scattered sunlight
+// is Henyey-Greenstein (normalized by 1 / 4 pi) with a strong forward peak plus a soft one, the glow around a low sun.
+vec3 applyHaze(vec3 c, vec2 p, vec2 size, float d) {
+    vec3 up = cross(pc.camRight.xyz, pc.camForward.xyz) * (size.y / size.x);
+    vec2 ndc = (p / size) * 2.0 - 1.0;
+    vec3 dir = normalize(pc.camForward.xyz + ndc.x * pc.camRight.xyz - ndc.y * up);
+    float b = pc.hazeSun.w, h0 = pc.sunDir.w;
+    float bd = b * dir.y * d;
+    float shape = abs(bd) < 1e-3 ? 1.0 - 0.5 * bd : (1.0 - exp(-bd)) / bd;
+    float depth = pc.hazeColor.w * exp(-b * max(h0, 0.0)) * d * shape;
+    float T = exp(-depth);
+    float mu = dot(dir, pc.sunDir.xyz);
+    float g1 = 0.75, g2 = 0.2;
+    float hg1 = (1.0 - g1 * g1) / pow(1.0 + g1 * g1 - 2.0 * g1 * mu, 1.5);
+    float hg2 = (1.0 - g2 * g2) / pow(1.0 + g2 * g2 - 2.0 * g2 * mu, 1.5);
+    vec3 inscatter = pc.hazeColor.rgb + pc.hazeSun.rgb * (0.25 * hg1 + 0.75 * hg2) * 0.0796;
+    return c * T + inscatter * (1.0 - T);
+}
+
 // Radiance of one traced texel. The albedo is multiplied back in per texel, before any interpolation.
 vec3 radiance(ivec2 r) {
     r = clamp(r, ivec2(0), imageSize(accumImage) - 1);
@@ -176,6 +204,9 @@ vec3 upscaled(vec2 t) {
     return clamp(sum, lo, hi);
 }
 
+// One output pixel: radiance at its position in the traced image (inside the overscan border), haze and lens
+// flares in the lit view, debug view 4 (history length: red new, green at the limit) or 3 (noise estimate as a heat
+// map), tone mapping and gamma, then the premultiplied UI "over" it.
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(outputImage);
@@ -183,20 +214,25 @@ void main() {
 
     vec2 margin = vec2(pc.marginX, pc.marginY);
     bool native = pc.scaleX == 1.0 && pc.scaleY == 1.0;
-    vec2 t = (vec2(p) + 0.5) * vec2(pc.scaleX, pc.scaleY) + margin;   // position in the traced images
-    ivec2 r = native ? p + ivec2(margin) : ivec2(t);                    // nearest traced texel, for debug views
+    vec2 t = (vec2(p) + 0.5) * vec2(pc.scaleX, pc.scaleY) + margin;
+    ivec2 r = native ? p + ivec2(margin) : ivec2(t);
     vec3 c = native ? radiance(r) : upscaled(t);
-    if (pc.flareStrength > 0.0 && pc.debugMode == 0u) c += lensFlares(vec2(p) + 0.5);
+    bool lit = pc.debugMode == 0u;
+    if (pc.hazeColor.w > 0.0 && lit) {
+        vec4 nd = imageLoad(guideND, clamp(r, ivec2(0), imageSize(guideND) - 1));
+        if (dot(nd.xyz, nd.xyz) > 0.25 && nd.w > 0.0) c = applyHaze(c, vec2(p) + 0.5, vec2(size), nd.w);
+    }
+    if (pc.flareStrength > 0.0 && lit) c += lensFlares(vec2(p) + 0.5);
     vec3 mapped;
-    if (pc.debugMode == 4u) { // history length: red = new, green = at the limit
+    if (pc.debugMode == 4u) {
         float lim = pc.historyLimit == 0u ? 256.0 : float(pc.historyLimit);
         float t = clamp(imageLoad(metaImage, r).x / lim, 0.0, 1.0);
         mapped = mix(vec3(0.9, 0.1, 0.05), vec3(0.1, 0.85, 0.2), sqrt(t)) * (0.35 + 0.65 * t);
-    } else if (pc.debugMode == 3u) { // noise estimate (standard deviation of the mean) as a heat map
+    } else if (pc.debugMode == 3u) {
         float sd = sqrt(max(pc.source == 2u ? imageLoad(pingB, r).a : imageLoad(pingA, r).a, 0.0)) * 8.0;
         mapped = clamp(vec3(sd, sd * 0.5, 1.0 - sd) * min(sd * 4.0, 1.0), 0.0, 1.0);
     } else {
-        mapped = pc.debugMode == 0u ? acesFilm(c * pc.exposure) : clamp(c, 0.0, 1.0);
+        mapped = lit ? acesFilm(c * pc.exposure) : clamp(c, 0.0, 1.0);
     }
     mapped = pow(mapped, vec3(1.0 / 2.2));
 
@@ -205,7 +241,7 @@ void main() {
         float a = float(c >> 24u) / 255.0;
         if (a > 0.0) {
             vec3 rgb = vec3(float((c >> 16u) & 255u), float((c >> 8u) & 255u), float(c & 255u)) / 255.0;
-            mapped = mapped * (1.0 - a) + rgb;          // premultiplied "over"
+            mapped = mapped * (1.0 - a) + rgb;
         }
     }
     imageStore(outputImage, p, vec4(mapped, 1.0));

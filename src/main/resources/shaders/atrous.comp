@@ -25,6 +25,8 @@ layout(push_constant) uniform Params {
     float sigmaDepth;     // relative, ~0.02
     float sigmaAlbedo;    // ~0.1
     int   demodulate;     // 1: filter radiance / albedo; composite multiplies the albedo back
+    uint  frame;          // rotates the disocclusion fix's sampling pattern
+    float fixStrength;    // weight of the disocclusion fix's estimate per sample of history advantage, 0 = off
 } pc;
 
 float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -43,6 +45,89 @@ bool inside(ivec2 p, ivec2 size) { return all(greaterThanEqual(p, ivec2(0))) && 
 // Albedo used for demodulation; must match composite.comp. Sky and black surfaces are not demodulated.
 vec3 demodAlbedo(vec3 a) { return pc.demodulate == 0 || luminance(a) < 1e-3 ? vec3(1.0) : max(a, vec3(0.02)); }
 
+// Disocclusion fix
+//
+// A pixel that just came into view - behind an edge the camera moves past - starts with a few catch-up samples.
+// Its illumination is noisy and often far too dark, and the a-trous filter alone cannot hide that: its neighbors
+// in the newly revealed band are just as new, and the luminance stop keeps the converged surface next to the band
+// out. This pass treats the converged neighborhood as a prior. It gathers the illumination of neighbors that lie
+// on the same surface (normal, depth) and have more samples than the pixel, and blends it in with the weight of
+// their extra samples, so a new pixel looks like its surroundings right away and its own samples take over as they
+// accumulate. Because the image is demodulated, texture detail is not blurred; only the lighting is borrowed.
+// Pixels whose history was merely shortened (moving camera, glass, mirrors) have neighbors with equally short
+// histories and are left alone.
+const int   FIX_TAPS = 16;
+const float FIX_FRAMES = 32.0;
+
+const float FIX_RADIUS = 14.0;
+
+const float FIX_MIN_RADIUS = 3.0;
+// Light differences above this many standard deviations of the pixel's own estimate are real (a shadow edge)
+// rather than noise, and such neighbors are left out.
+const float FIX_SIGMAS = 3.0;
+
+// The disocclusion fix for one pixel. Gathers FIX_TAPS taps on a Vogel disk, rotated per pixel and frame (the
+// temporal stage averages the pattern away). The luminance test only starts once the pixel has more than its
+// catch-up samples, since a brand-new pixel's own estimate is too noisy to judge its neighbors by; its sigma comes
+// from mode 0's variance, where dark outliers already carry their neighbors' spread. The estimate's weight in samples
+// is the neighbors' mean extra samples, faded out towards FIX_FRAMES and reduced when few taps match; its variance is
+// taken over too, as it is far less noisy than the pixel.
+vec4 disocclusionFix(ivec2 p, ivec2 size, vec3 nC, float zC) {
+    vec4 center = imageLoad(srcImage, p);
+    float count = imageLoad(metaImage, p).x;
+    if (pc.fixStrength <= 0.0 || zC <= 0.0 || count >= FIX_FRAMES) return center;
+    float lC = luminance(center.rgb);
+    float sigma = sqrt(max(center.a, 0.0)) * FIX_SIGMAS + 0.05 * lC + 1e-3;
+    float radius = mix(FIX_RADIUS, FIX_MIN_RADIUS, count / FIX_FRAMES);
+    float angle = fract(52.9829189 * fract(dot(vec2(p), vec2(0.06711056, 0.00583715))) + float(pc.frame % 64u) * 0.618034) * 6.2831853;
+    vec3 sum = vec3(0.0);
+    float wSum = 0.0, advantage = 0.0, geoSum = 0.0, varSum = 0.0;
+    for (int i = 0; i < FIX_TAPS; ++i) {
+        float r = radius * sqrt((float(i) + 0.5) / float(FIX_TAPS));
+        float a = float(i) * 2.3999632 + angle;
+        ivec2 q = p + ivec2(round(vec2(cos(a), sin(a)) * r));
+        if (!inside(q, size) || q == p) continue;
+        vec4 ndQ = imageLoad(gNormalDepth, q);
+        if (ndQ.w <= 0.0) continue;
+        float cq = imageLoad(metaImage, q).x;
+        float extra = cq - count;
+        if (extra <= 0.0) continue;
+        float g = pow(max(dot(nC, ndQ.xyz), 0.0), 32.0) * exp(-abs(zC - ndQ.w) / (0.01 * zC * max(r, 1.0) + 1e-3));
+        if (g < 1e-3) continue;
+        vec4 s = imageLoad(srcImage, q);
+        float wl = exp(-abs(luminance(s.rgb) - lC) / sigma);
+        wl = mix(1.0, wl, clamp((count - 8.0) / 16.0, 0.0, 1.0));
+        float w = g * wl * extra;
+        sum += s.rgb * w;
+        varSum += s.a * w;
+        wSum += w;
+        advantage += g * wl * min(extra, FIX_FRAMES);
+        geoSum += g;
+    }
+    if (wSum <= 0.0) return center;
+    float k = pc.fixStrength * advantage / max(geoSum, 1e-6) * (1.0 - smoothstep(0.5 * FIX_FRAMES, FIX_FRAMES, count));
+    k *= clamp(geoSum / 3.0, 0.0, 1.0);
+    float own = max(count, 1.0);
+    float t = k / (own + k);
+    vec3 color = mix(center.rgb, sum / wSum, t);
+    float variance = mix(center.a, varSum / wSum, t);
+    return storable(vec4(color, variance));
+}
+
+// One pixel of the pass selected by pc.mode.
+//
+// Mode 0, variance estimation: the illumination (radiance / albedo) and the variance of its mean, from the history's
+// second moment (Var[X] = E[X^2] - E[X]^2, over N) once there are 4 samples, before that from similar neighbors in
+// a 7x7 window (doubled, since spatial estimates under-represent the per-pixel noise). Then firefly suppression on
+// the filter input only, also on converged pixels, so the accumulation stays unbiased: a pixel far brighter than all
+// of its surface neighbors (any surface pixel counts, since at model edges and on normal-mapped surfaces few share
+// the normal) is pulled down to them. A pixel far darker than all of them would claim a variance of 0, keep every
+// neighbor out and grow into a black blotch; it gets the spread to its neighbors as variance instead.
+//
+// Mode 2, the disocclusion fix, see above.
+//
+// Mode 1, one a-trous iteration: the 5x5 kernel, its luminance stop scaled by the 3x3-blurred variance, which makes
+// edge stopping more robust. Sky pixels pass unchanged.
 void main() {
     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
     ivec2 size = imageSize(accumImage);
@@ -53,21 +138,18 @@ void main() {
     float zC = ndC.w;
     vec3 aC = imageLoad(gAlbedo, p).rgb;
 
-    // Variance estimation
     if (pc.mode == 0) {
         vec4 acc = imageLoad(accumImage, p);
         vec3 alb = demodAlbedo(aC);
         float albL = luminance(alb);
-        acc.rgb /= alb;                                  // illumination
-        acc.a /= albL * albL;                            // approximate second moment of the luminance
+        acc.rgb /= alb;
+        acc.a /= albL * albL;
         float l = luminance(acc.rgb);
         float count = max(imageLoad(metaImage, p).x, 1.0);
         float variance;
         if (count >= 4.0) {
-            // Temporal estimate: Var[X] = E[X^2] - E[X]^2; the variance of the mean is Var / N.
             variance = max(acc.a - l * l, 0.0) / count;
         } else {
-            // Too few samples: estimate from similar neighbors in a 7x7 window.
             float s1 = 0.0, s2 = 0.0, wSum = 0.0;
             for (int dy = -3; dy <= 3; ++dy) {
                 for (int dx = -3; dx <= 3; ++dx) {
@@ -83,16 +165,10 @@ void main() {
             }
             float mean = s1 / max(wSum, 1e-6);
             variance = max(s2 / max(wSum, 1e-6) - mean * mean, 0.0) / count;
-            variance *= 2.0; // spatial estimates under-represent the true per-pixel noise
+            variance *= 2.0;
         }
-
-        // Firefly suppression on the filter input only; the accumulation stays unbiased. A pixel far brighter
-        // than all of its neighbors is clamped to them. A pixel far darker than all of them - on a dim surface some
-        // pixels stay at almost 0 for a hundred samples - claims a variance of 0, so the luminance stop below would
-        // keep every neighbor out and the dark pixels would grow into black blotches; it gets the spread to its
-        // neighbors as variance instead.
         vec3 color = acc.rgb;
-        if ((pc.historyLimit == 0u || count < 0.95 * float(pc.historyLimit)) && count < 256.0 && zC > 0.0) {
+        if (zC > 0.0) {
             float maxL = 0.0, minL = 1e30;
             vec3 meanC = vec3(0.0);
             float cnt = 0.0;
@@ -102,8 +178,6 @@ void main() {
                     ivec2 q = p + ivec2(dx, dy);
                     if (!inside(q, size)) continue;
                     vec4 ndQ = imageLoad(gNormalDepth, q);
-                    // Any surface pixel counts, not only ones with similar normals: at model edges and on
-                    // normal-mapped surfaces few neighbors share the normal, and a firefly outshines them all.
                     if (ndQ.w <= 0.0) continue;
                     vec3 cq = imageLoad(accumImage, q).rgb / demodAlbedo(imageLoad(gAlbedo, q).rgb);
                     maxL = max(maxL, luminance(cq));
@@ -112,7 +186,7 @@ void main() {
                     cnt += 1.0;
                 }
             }
-            float limit = maxL * 1.5 + 0.02;
+            float limit = maxL * (count >= 32.0 ? 2.0 : 1.5) + 0.02;
             if (cnt >= 4.0 && l > limit) {
                 color = mix(meanC / cnt, color * (limit / l), 0.5);
                 variance = max(variance, (l - limit) * (l - limit) / count);
@@ -124,14 +198,17 @@ void main() {
         return;
     }
 
-    // A-trous iteration
+    if (pc.mode == 2) {
+        imageStore(dstImage, p, disocclusionFix(p, size, nC, zC));
+        return;
+    }
+
     vec4 center = imageLoad(srcImage, p);
-    if (zC <= 0.0) { // sky
+    if (zC <= 0.0) {
         imageStore(dstImage, p, center);
         return;
     }
 
-    // A light 3x3 blur of the variance makes edge stopping more robust.
     float varBlur = 0.0, varW = 0.0;
     for (int dy = -1; dy <= 1; ++dy) {
         for (int dx = -1; dx <= 1; ++dx) {

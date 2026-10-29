@@ -24,15 +24,6 @@ import static org.lwjgl.vulkan.VK13.*;
  */
 public final class LensFlare implements AutoCloseable {
     private static final int HEADER = 96, ENTRY = 48;
-    /**
-     * Scales lens irradiance to flare intensity. A candle 3 m away (about 0.005 at the lens) gives an intensity of
-     * about 1, a few percent of the light carried by its pixels.
-     */
-    public static final float POINT_GAIN = 200f;
-
-    /** Point source flares fade out between these distances in meters, so they appear as the player approaches. */
-    public float fadeNear = 1.0f, fadeFar = 4.5f;
-
     private final VkContext ctx;
     public final int maxFlares;
     public final Buffer buffer;
@@ -93,20 +84,6 @@ public final class LensFlare implements AutoCloseable {
 
     /** Clears the source list. The GPU must be done with the previous frame. */
     public void begin() { count = 0; }
-
-    /** Adds a sphere light; its lens irradiance is radiance times projected area over squared distance. */
-    public void addPoint(Vector3f position, float radius, Vector3f radiance, Vector3f camPos) {
-        if (count >= maxFlares) return;
-        float d2 = Math.max(position.distanceSquared(camPos), 1e-4f);
-        float k = (float) Math.PI * radius * radius / d2 * POINT_GAIN * distanceFade((float) Math.sqrt(d2));
-        put(position.x, position.y, position.z, radius, radiance.x * k, radiance.y * k, radiance.z * k);
-    }
-
-    public float distanceFade(float d) {
-        if (fadeFar <= fadeNear) return d <= fadeNear ? 1 : 0;
-        float t = Math.min(Math.max((d - fadeNear) / (fadeFar - fadeNear), 0f), 1f);
-        return 1 - t * t * (3 - 2 * t);
-    }
 
     /** Adds a directional source such as the sun. */
     public void addDirectional(Vector3f direction, float angularRadius, Vector3f intensity) {

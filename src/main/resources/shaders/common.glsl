@@ -1,7 +1,13 @@
+// LUMVEX_RASTER_SHADE: included by the raster-only shading pass (raster_shade.comp), which also runs on GPUs
+// without ray tracing or 64-bit integers; buffer addresses are then two 32-bit halves.
+#ifndef LUMVEX_RASTER_SHADE
 #extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#else
+#extension GL_EXT_buffer_reference_uvec2 : require
+#endif
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 
 const float PI = 3.14159265358979323846;
 
@@ -33,12 +39,17 @@ struct Material {
     float uvScale;
     float normalStrength;
     uint  flags;         // MATERIAL_* bits
-    float pad3;
+    float parallax;      // relief depth of the height map in meters, 0 = flat
 };
 
 struct InstanceInfo {
+#ifndef LUMVEX_RASTER_SHADE
     uint64_t vertexAddress;
     uint64_t indexAddress;
+#else
+    uvec2    vertexAddress;
+    uvec2    indexAddress;
+#endif
     uint     materialIndex;
     uint     flags;          // bit 0: animated object
 };
@@ -166,19 +177,21 @@ float smithG1(float NdotX, float alpha) {
 
 const float SUN_COS_ANGLE = 0.99955; // about 1.7 degrees angular radius
 
-// Procedural sky: horizon-to-zenith gradient, a glow around the sun and, at night, stars.
+// Procedural sky: horizon-to-zenith gradient and a glow around the sun. At night a deep blue zenith over a paler
+// horizon (airglow, distant towns), the moon's halo from the same glow terms, and stars from a sparse hash over
+// direction cells, fading out towards the horizon.
 vec3 skyColor(vec3 dir) {
-    vec3 zenith = vec3(0.18, 0.36, 0.78);
-    vec3 horizon = vec3(0.80, 0.86, 0.95);
-    vec3 groundCol = vec3(0.25, 0.23, 0.21);
+    bool night = (pc.flags & FLAG_NIGHT) != 0u;
+    vec3 zenith = night ? vec3(0.010, 0.016, 0.040) : vec3(0.18, 0.36, 0.78);
+    vec3 horizon = night ? vec3(0.040, 0.046, 0.065) : vec3(0.80, 0.86, 0.95);
+    vec3 groundCol = night ? vec3(0.012, 0.012, 0.014) : vec3(0.25, 0.23, 0.21);
     vec3 sky = dir.y >= 0.0
         ? mix(horizon, zenith, pow(dir.y, 0.45))
         : mix(horizon, groundCol, clamp(-dir.y * 5.0, 0.0, 1.0));
     float s = max(dot(dir, normalize(pc.sunDirection)), 0.0);
-    sky += pc.sunColor * (pow(s, 64.0) * 0.6 + pow(s, 8.0) * 0.1);
+    sky += pc.sunColor * (pow(s, 64.0) * 0.6 + pow(s, 8.0) * 0.1) * (night ? 0.06 : 1.0);
     sky *= pc.skyIntensity;
-    if ((pc.flags & FLAG_NIGHT) != 0u && dir.y > 0.0) {
-        // Stars from a sparse hash over direction cells, fading out towards the horizon.
+    if (night && dir.y > 0.0) {
         vec3 d = dir * 700.0;
         vec3 cell = floor(d);
         float h = fract(sin(dot(cell, vec3(12.9898, 78.233, 45.164))) * 43758.5453);

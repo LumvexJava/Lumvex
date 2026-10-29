@@ -202,14 +202,24 @@ public final class ScriptRuntime {
     /** Statistics line provided by the host for {@link Render#stats()}. */
     public volatile String statsText = "";
 
-    /** The player camera entity, or null. */
+    /**
+     * The player camera entity, or null. Asked every frame, so the last answer is checked first instead of searching
+     * all objects.
+     */
     public Entity cameraEntity() {
+        if (cameraObject != null && objects.get(cameraObject.e.id) == cameraObject) {
+            CameraComponent c = cameraObject.e.get(CameraComponent.class);
+            if (c != null && c.player) return cameraObject.e;
+        }
+        cameraObject = null;
         for (GameObject o : objects.values()) {
             CameraComponent c = o.e.get(CameraComponent.class);
-            if (c != null && c.player) return o.e;
+            if (c != null && c.player) { cameraObject = o; return o.e; }
         }
         return null;
     }
+
+    private GameObject cameraObject;
 
     public SceneScript sceneScript() { return sceneScript; }
 

@@ -39,5 +39,12 @@ public final class RenderSettings {
         scene.settingsChanged();
     }
 
+    public void setRenderMode(String mode) {
+        settings().renderMode = mode;
+        scene.settingsChanged();
+    }
+
+    public String renderMode() { return settings().renderMode; }
+
     private Settings settings() { return scene.document().settings; }
 }

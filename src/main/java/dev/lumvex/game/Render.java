@@ -70,9 +70,10 @@ public final class Render extends SystemScript {
 
     /**
      * Selects a debug visualization: 0 final image, 1 normals, 2 albedo, 3 denoiser noise estimate, 4 history length,
-     * 5 influence zones of moving objects, 6 virtual texture mip levels, 7 path length.
+     * 5 influence zones of moving objects, 6 virtual texture mip levels, 7 path length, 8 raster check (hybrid
+     * rendering: red where the rasterized and the traced primary surface differ).
      */
-    public void debugView(int view) { rt.debugView = Math.max(0, Math.min(7, view)); }
+    public void debugView(int view) { rt.debugView = Math.max(0, Math.min(8, view)); }
 
     public int debugView() { return rt.debugView; }
 

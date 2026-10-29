@@ -80,6 +80,18 @@ public final class PbrImages {
     public static TextureSet build(String name, int size, BufferedImage albedo, BufferedImage normalGl,
                                    BufferedImage roughness, int roughChannel, BufferedImage metallic, int metalChannel,
                                    BufferedImage ao) {
+        return build(name, size, albedo, normalGl, roughness, roughChannel, metallic, metalChannel, ao, null);
+    }
+
+    /**
+     * As above, with a height map: height (displacement) in the red channel, white = top, or null for flat. It is
+     * stretched to the full 0..255 range, so the relief depth means what it says, and stored in the ORM map's alpha
+     * channel for parallax occlusion mapping. The green channel of the normal map is flipped, since the engine's
+     * tangent frame has v pointing down.
+     */
+    public static TextureSet build(String name, int size, BufferedImage albedo, BufferedImage normalGl,
+                                   BufferedImage roughness, int roughChannel, BufferedImage metallic, int metalChannel,
+                                   BufferedImage ao, BufferedImage height) {
         int n = size * size;
         ByteBuffer a = memAlloc(n * 4), nm = memAlloc(n * 4), orm = memAlloc(n * 4);
         int[] pa = pixels(albedo, size);
@@ -90,17 +102,21 @@ public final class PbrImages {
         int[] pn = normalGl != null ? pixels(normalGl, size) : null;
         for (int i = 0; i < n; i++) {
             int c = pn != null ? pn[i] : 0xFF8080FF;
-            // The engine's tangent frame has v pointing down, so the green channel of OpenGL maps is flipped.
             nm.put(i * 4, (byte) (c >> 16)).put(i * 4 + 1, (byte) (255 - ((c >> 8) & 0xFF))).put(i * 4 + 2, (byte) c).put(i * 4 + 3, (byte) 255);
         }
         int[] pr = roughness != null ? pixels(roughness, size) : null;
         int[] pm = metallic != null ? (metallic == roughness ? pr : pixels(metallic, size)) : null;
         int[] po = ao != null ? pixels(ao, size) : null;
+        int[] ph = height != null ? pixels(height, size) : null;
+        int hmin = 255, hmax = 0;
+        if (ph != null) for (int c : ph) { int h = (c >> 16) & 0xFF; hmin = Math.min(hmin, h); hmax = Math.max(hmax, h); }
+        float hscale = 255f / Math.max(1, hmax - hmin);
         for (int i = 0; i < n; i++) {
             int r = pr != null ? (pr[i] >> (16 - 8 * roughChannel)) & 0xFF : 255;
             int m = pm != null ? (pm[i] >> (16 - 8 * metalChannel)) & 0xFF : 0;
             int o = po != null ? (po[i] >> 16) & 0xFF : 255;
-            orm.put(i * 4, (byte) o).put(i * 4 + 1, (byte) r).put(i * 4 + 2, (byte) m).put(i * 4 + 3, (byte) 255);
+            int h = ph != null ? Math.min(255, Math.round((((ph[i] >> 16) & 0xFF) - hmin) * hscale)) : 255;
+            orm.put(i * 4, (byte) o).put(i * 4 + 1, (byte) r).put(i * 4 + 2, (byte) m).put(i * 4 + 3, (byte) h);
         }
         return TextureSet.of(name, size, a, nm, orm);
     }
@@ -113,27 +129,28 @@ public final class PbrImages {
     private static final String[] METAL = {"metal", "metallic", "metalness", "mtl"};
     private static final String[] AO = {"ao", "ambientocclusion", "occlusion", "occ"};
     private static final String[] ARM = {"arm"};
+    private static final String[] HEIGHT = {"disp", "displacement", "height", "heightmap", "bump"};
     private static final Set<String> IMAGE_TYPES = Set.of("png", "jpg", "jpeg", "bmp", "tif", "tiff", "gif");
 
     /**
      * Loads a texture folder. Maps are recognized by file name: Poly Haven style ({@code _diff_}, {@code _nor_gl_},
      * {@code _arm_}, ...) as well as common names like basecolor, normal, roughness or metallic. A packed ARM map
-     * (occlusion, roughness, metallic) is used when the separate maps are missing.
+     * (occlusion, roughness, metallic) is used when the separate maps are missing, DirectX normal maps are converted,
+     * and empty files from broken downloads are skipped so that another map can take their place.
      */
     public static TextureSet loadFolder(Path folder, int maxSize) throws IOException {
         List<Path> images = new ArrayList<>();
         try (var s = Files.list(folder)) {
-            // Empty files from broken downloads are skipped so that another map can take their place.
             s.filter(p -> IMAGE_TYPES.contains(ext(p)) && sizeOf(p) > 0).sorted().forEach(images::add);
         }
         Path diff = role(images, ALBEDO), norDx = role(images, NORMAL_DX), nor = norDx != null ? norDx : role(images, NORMAL);
         Path rough = role(images, ROUGH), metal = role(images, METAL), ao = role(images, AO), arm = role(images, ARM);
+        Path disp = role(images, HEIGHT);
         if (diff == null) throw new IOException("no albedo / color image in " + folder + " (names like *_diff_*, *basecolor*, *albedo*)");
         long t0 = System.nanoTime();
         BufferedImage d = read(diff);
         int size = sizeFor(d, maxSize);
         BufferedImage n = nor != null ? optional(nor) : null;
-        // DirectX to OpenGL convention
         if (n != null && norDx != null) n = flipGreen(n);
         BufferedImage r, m, o;
         int rc = 0, mc = 0;
@@ -146,7 +163,7 @@ public final class PbrImages {
             m = metal != null ? optional(metal) : null;
             o = ao != null ? optional(ao) : null;
         }
-        TextureSet set = build(folder.getFileName().toString(), size, d, n, r, rc, m, mc, o);
+        TextureSet set = build(folder.getFileName().toString(), size, d, n, r, rc, m, mc, o, disp != null ? optional(disp) : null);
         System.out.printf("[textures] %-30s %dx%d (from %dx%d) in %.1f s%n", set.name, size, size, d.getWidth(), d.getHeight(),
                 (System.nanoTime() - t0) / 1e9);
         return set;

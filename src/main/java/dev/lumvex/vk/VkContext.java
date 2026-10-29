@@ -29,12 +29,12 @@ import static org.lwjgl.vulkan.VK13.*;
  */
 public final class VkContext implements AutoCloseable {
 
-    private static final List<String> DEVICE_EXTENSIONS = List.of(
-            VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+    private static final List<String> DEVICE_EXTENSIONS = List.of(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    /** Hardware ray tracing, with ray queries for the lens flares' visibility rays; without all of them the device rasterizes only. */
+    private static final List<String> RAY_TRACING_EXTENSIONS = List.of(
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
             VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
-            // visibility rays from compute shaders (lens flares)
             KHRRayQuery.VK_KHR_RAY_QUERY_EXTENSION_NAME
     );
 
@@ -54,6 +54,8 @@ public final class VkContext implements AutoCloseable {
     public final int maxRayRecursionDepth;
     public final int minScratchOffsetAlignment;
     public final float timestampPeriodNs;
+    /** Largest side of a 2D image, e.g. 16384 or 32768. */
+    public final int maxImageDimension2D;
     public final boolean timestampsSupported;
     public final boolean memoryBudgetSupported;
     /** Float atomic add on storage buffers, needed by the radiance cache. */
@@ -62,11 +64,30 @@ public final class VkContext implements AutoCloseable {
     public final boolean invocationReorderSupported;
     /** BC1-BC7 texture formats. */
     public final boolean textureCompressionBC;
+    /**
+     * Hardware ray tracing (pipelines, acceleration structures, ray queries). False on GPUs without it, or with
+     * {@code -Dlumvex.noraytracing=true}: the renderer then rasterizes only.
+     */
+    public final boolean rayTracingSupported;
+    /** 64-bit integers in shaders; the GPU block compression encoder needs them (many integrated GPUs lack them). */
+    public final boolean shaderInt64Supported;
+    /**
+     * Pipeline stage of the passes that read the frame's images and textures: ray tracing, or compute on GPUs
+     * without ray tracing (where the ray tracing stage is not allowed in barriers).
+     */
+    public final int rtStage;
 
     private final long debugMessenger;
     private final VkDebugUtilsMessengerCallbackEXT debugCallback;
 
-    /** Validation is enabled only if requested and the Khronos layer is installed. */
+    /**
+     * Creates the instance, the surface and the device. Validation is enabled only if requested and the Khronos layer
+     * is installed. Of the Vulkan 1.3 GPUs, ray tracing ones are preferred, then discrete over integrated ones;
+     * {@code -Dlumvex.gpu=<name part>} overrides both, {@code -Dlumvex.noraytracing=true} ignores ray tracing.
+     * Enabled are the ray tracing features where the GPU has them (with shader execution reordering, which sorts
+     * incoherent bounce rays before shading, on Ada and newer), float atomics, dynamic rendering, multi-draw indirect
+     * and geometry shaders (for {@code gl_PrimitiveID} in the raster pass's fragment shader).
+     */
     public VkContext(RenderSurface target, boolean requestValidation) {
         try (MemoryStack stack = stackPush()) {
             boolean validation = requestValidation && validationLayerAvailable();
@@ -130,32 +151,41 @@ public final class VkContext implements AutoCloseable {
             PointerBuffer devices = stack.mallocPointer(ip.get(0));
             vkEnumeratePhysicalDevices(instance, ip, devices);
 
+            String wanted = System.getProperty("lumvex.gpu", "").toLowerCase(java.util.Locale.ROOT);
+            boolean noRayTracing = Boolean.getBoolean("lumvex.noraytracing");
             VkPhysicalDevice chosen = null;
             int chosenFamily = -1;
             int bestScore = -1;
+            boolean chosenRt = false;
             for (int i = 0; i < devices.capacity(); i++) {
                 VkPhysicalDevice pd = new VkPhysicalDevice(devices.get(i), instance);
                 int family = findQueueFamily(pd, stack);
-                if (family < 0 || !supportsExtensions(pd)) continue;
+                Set<String> ext = deviceExtensions(pd);
+                if (family < 0 || !ext.containsAll(DEVICE_EXTENSIONS)) continue;
                 VkPhysicalDeviceProperties props = VkPhysicalDeviceProperties.calloc(stack);
                 vkGetPhysicalDeviceProperties(pd, props);
-                int score = props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1;
+                if (VK_API_VERSION_MINOR(props.apiVersion()) < 3 && VK_API_VERSION_MAJOR(props.apiVersion()) <= 1) continue;
+                boolean rt = !noRayTracing && ext.containsAll(RAY_TRACING_EXTENSIONS);
+                int score = (rt ? 10 : 0) + (props.deviceType() == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 2 : 1)
+                        + (!wanted.isEmpty() && props.deviceNameString().toLowerCase(java.util.Locale.ROOT).contains(wanted) ? 100 : 0);
                 if (score > bestScore) {
                     bestScore = score;
                     chosen = pd;
                     chosenFamily = family;
+                    chosenRt = rt;
                 }
             }
-            if (chosen == null) {
-                throw new IllegalStateException("No GPU with VK_KHR_ray_tracing_pipeline + VK_KHR_acceleration_structure found");
-            }
+            if (chosen == null) throw new IllegalStateException("No GPU with Vulkan 1.3 found");
             physicalDevice = chosen;
             queueFamily = chosenFamily;
+            rayTracingSupported = chosenRt;
+            rtStage = chosenRt ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
             VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtProps = VkPhysicalDeviceRayTracingPipelinePropertiesKHR.calloc(stack).sType$Default();
             VkPhysicalDeviceAccelerationStructurePropertiesKHR asProps = VkPhysicalDeviceAccelerationStructurePropertiesKHR.calloc(stack).sType$Default();
             rtProps.pNext(asProps.address());
-            VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(rtProps.address());
+            VkPhysicalDeviceProperties2 props2 = VkPhysicalDeviceProperties2.calloc(stack).sType$Default();
+            if (rayTracingSupported) props2.pNext(rtProps.address());
             vkGetPhysicalDeviceProperties2(physicalDevice, props2);
             deviceName = props2.properties().deviceNameString();
             shaderGroupHandleSize = rtProps.shaderGroupHandleSize();
@@ -164,6 +194,7 @@ public final class VkContext implements AutoCloseable {
             maxRayRecursionDepth = rtProps.maxRayRecursionDepth();
             minScratchOffsetAlignment = asProps.minAccelerationStructureScratchOffsetAlignment();
             timestampPeriodNs = props2.properties().limits().timestampPeriod();
+            maxImageDimension2D = props2.properties().limits().maxImageDimension2D();
             timestampsSupported = queueTimestampBits(physicalDevice, queueFamily, stack) > 0;
             Set<String> available = deviceExtensions(physicalDevice);
             memoryBudgetSupported = available.contains(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
@@ -175,7 +206,7 @@ public final class VkContext implements AutoCloseable {
             }
             atomicFloatAddSupported = atomicFloat;
             boolean reorder = false;
-            if (available.contains(EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)) {
+            if (rayTracingSupported && available.contains(EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME)) {
                 VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT rf = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack).sType$Default();
                 vkGetPhysicalDeviceFeatures2(physicalDevice, VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(rf.address()));
                 reorder = rf.rayTracingInvocationReorder();
@@ -184,6 +215,7 @@ public final class VkContext implements AutoCloseable {
             VkPhysicalDeviceFeatures supported = VkPhysicalDeviceFeatures.calloc(stack);
             vkGetPhysicalDeviceFeatures(physicalDevice, supported);
             textureCompressionBC = supported.textureCompressionBC();
+            shaderInt64Supported = supported.shaderInt64();
 
             memoryProperties = VkPhysicalDeviceMemoryProperties.malloc();
             vkGetPhysicalDeviceMemoryProperties(physicalDevice, memoryProperties);
@@ -195,7 +227,6 @@ public final class VkContext implements AutoCloseable {
                     .sType$Default()
                     .rayTracingPipeline(true);
             if (atomicFloatAddSupported) rtFeatures.pNext(atomicFeatures.address());
-            // Shader execution reordering (Ada and newer) sorts incoherent bounce rays before shading.
             VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT reorderFeatures = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack)
                     .sType$Default()
                     .rayTracingInvocationReorder(true)
@@ -212,7 +243,9 @@ public final class VkContext implements AutoCloseable {
                     .sType$Default()
                     .synchronization2(true)
                     .maintenance4(true)
-                    .pNext(asFeatures.address());
+                    .dynamicRendering(true);
+            if (rayTracingSupported) v13.pNext(asFeatures.address());
+            else if (atomicFloatAddSupported) v13.pNext(atomicFeatures.address());
             VkPhysicalDeviceVulkan12Features v12 = VkPhysicalDeviceVulkan12Features.calloc(stack)
                     .sType$Default()
                     .bufferDeviceAddress(true)
@@ -224,7 +257,9 @@ public final class VkContext implements AutoCloseable {
             VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                     .sType$Default()
                     .pNext(v12.address());
-            features2.features().shaderInt64(true).textureCompressionBC(textureCompressionBC);
+            features2.features().shaderInt64(shaderInt64Supported).textureCompressionBC(textureCompressionBC)
+                    .multiDrawIndirect(true).drawIndirectFirstInstance(true)
+                    .geometryShader(supported.geometryShader());
 
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack);
             queueInfo.get(0)
@@ -232,8 +267,9 @@ public final class VkContext implements AutoCloseable {
                     .queueFamilyIndex(queueFamily)
                     .pQueuePriorities(stack.floats(1.0f));
 
-            PointerBuffer extNames = stack.mallocPointer(DEVICE_EXTENSIONS.size() + 3);
+            PointerBuffer extNames = stack.mallocPointer(DEVICE_EXTENSIONS.size() + RAY_TRACING_EXTENSIONS.size() + 3);
             for (String e : DEVICE_EXTENSIONS) extNames.put(stack.UTF8(e));
+            if (rayTracingSupported) for (String e : RAY_TRACING_EXTENSIONS) extNames.put(stack.UTF8(e));
             if (memoryBudgetSupported) extNames.put(stack.UTF8(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME));
             if (atomicFloatAddSupported) extNames.put(stack.UTF8(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME));
             if (invocationReorderSupported) extNames.put(stack.UTF8(EXTRayTracingInvocationReorder.VK_EXT_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME));
@@ -291,10 +327,6 @@ public final class VkContext implements AutoCloseable {
             if (present.get(0) == VK_TRUE) return i;
         }
         return -1;
-    }
-
-    private static boolean supportsExtensions(VkPhysicalDevice pd) {
-        return deviceExtensions(pd).containsAll(DEVICE_EXTENSIONS);
     }
 
     private static Set<String> deviceExtensions(VkPhysicalDevice pd) {

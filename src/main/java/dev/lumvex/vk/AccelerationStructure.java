@@ -59,7 +59,10 @@ public final class AccelerationStructure implements AutoCloseable {
         }
     }
 
-    /** Creates an unbuilt TLAS with room for {@code maxInstances}. */
+    /**
+     * Creates an unbuilt TLAS with room for {@code maxInstances}; {@code scratchSizeOut} receives the scratch size,
+     * large enough for both full builds and refits.
+     */
     public static AccelerationStructure createTopLevel(VkContext ctx, Buffer instanceBuffer, int maxInstances, long[] scratchSizeOut) {
         try (MemoryStack stack = stackPush()) {
             VkAccelerationStructureGeometryKHR.Buffer geometry = topLevelGeometry(stack, instanceBuffer);
@@ -68,20 +71,27 @@ public final class AccelerationStructure implements AutoCloseable {
             VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
             vkGetAccelerationStructureBuildSizesKHR(ctx.device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     buildInfo.get(0), stack.ints(maxInstances), sizes);
-            scratchSizeOut[0] = sizes.buildScratchSize();
+            scratchSizeOut[0] = Math.max(sizes.buildScratchSize(), sizes.updateScratchSize());
             return new AccelerationStructure(ctx, VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, sizes.accelerationStructureSize());
         }
     }
 
-    private static final int TLAS_FLAGS = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    /** Refits are allowed: moving a few instances only updates the bounding volumes above them. */
+    private static final int TLAS_FLAGS = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+            | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
 
-    /** Records a full TLAS build. The caller is responsible for the barrier before tracing. */
-    public void recordTopLevelBuild(VkCommandBuffer cmd, Buffer instanceBuffer, int instanceCount, long scratchAddress) {
+    /**
+     * Records a TLAS build: a full one, or with {@code refit} an update of the last build with the same instances in
+     * new places, which costs a fraction of a build but lets the tree degrade as instances move far. The caller is
+     * responsible for the barrier before tracing.
+     */
+    public void recordTopLevelBuild(VkCommandBuffer cmd, Buffer instanceBuffer, int instanceCount, long scratchAddress, boolean refit) {
         try (MemoryStack stack = stackPush()) {
             VkAccelerationStructureGeometryKHR.Buffer geometry = topLevelGeometry(stack, instanceBuffer);
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer buildInfo = buildInfo(stack,
                     VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR, geometry, TLAS_FLAGS);
             buildInfo.get(0).dstAccelerationStructure(handle).scratchData().deviceAddress(scratchAddress);
+            if (refit) buildInfo.get(0).mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR).srcAccelerationStructure(handle);
             VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack)
                     .primitiveCount(instanceCount);
             vkCmdBuildAccelerationStructuresKHR(cmd, buildInfo, stack.pointers(range.address()));

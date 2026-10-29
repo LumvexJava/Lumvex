@@ -85,8 +85,17 @@ public final class Renderer implements AutoCloseable {
     private Buffer tlasInstanceBuffer;
     private AccelerationStructure tlas;
     private LensFlare flare;
+    /** Whether the GPU traces rays at all; without it everything below that needs ray tracing is left out. */
+    private final boolean rt;
+    /** The raster render mode's shading pass, see {@link RasterShade}. */
+    private final RasterShade rasterShade;
+    /** An empty flare list for the composite pass on GPUs without ray tracing (lens flares need ray queries). */
+    private Buffer noFlares;
     private Camera currentCamera;
     private Buffer tlasScratch;
+    /** Instances in the last TLAS build and refits since, see recordFrame. */
+    private int tlasBuiltCount = -1, tlasRefits;
+    private static final int REFIT_LIMIT = 120;
     private long tlasScratchAddress;
 
     private final RadianceCache cache;
@@ -136,6 +145,56 @@ public final class Renderer implements AutoCloseable {
     public int indirectShift = 0;
     /** ReSTIR DI for direct light. Off by default: in the test scenes it was noisier than plain NEE and cost 5.7 ms. */
     public boolean restir = false;
+    /** How a scene is rendered, see {@code SceneDoc.Settings.renderMode} and docs/HYBRID_RENDERING.md. */
+    public enum RenderMode {
+        /** Rasterized primary visibility, path traced light. */
+        HYBRID,
+        /** Everything path traced, the renderer of Lumvex 1.0. */
+        PATH,
+        /** Rasterization only: textured surfaces lit by the sun and the sky, no ray tracing. */
+        RASTER;
+
+        /** The mode named {@code "hybrid"}, {@code "path"} or {@code "raster"}; anything else is hybrid. */
+        public static RenderMode parse(String name) {
+            if (name == null) return HYBRID;
+            return switch (name.trim().toLowerCase(java.util.Locale.ROOT)) {
+                case "path", "pathtracing", "path_tracing" -> PATH;
+                case "raster", "rasterization" -> RASTER;
+                default -> HYBRID;
+            };
+        }
+    }
+
+    private RenderMode renderMode = RenderMode.HYBRID;
+
+    /** The mode in use: what the scene asked for, or {@link RenderMode#RASTER} on GPUs without ray tracing. */
+    public RenderMode renderMode() { return renderMode; }
+
+    /** Sets the render mode; GPUs without hardware ray tracing stay in {@link RenderMode#RASTER}. */
+    public void setRenderMode(RenderMode mode) {
+        RenderMode m = ctx.rayTracingSupported ? mode : RenderMode.RASTER;
+        if (m != renderMode) resetAccumulation();
+        renderMode = m;
+        rasterPrimary = m != RenderMode.PATH;
+    }
+
+    /**
+     * Take the primary surface of every pixel from the raster pre-pass instead of tracing a ray through its center
+     * (hybrid rendering, see {@link RasterPrepass}); follows the render mode.
+     */
+    public boolean rasterPrimary = true;
+    private final RasterPrepass raster;
+    /** Per instance: the object-to-world matrix as mat4x3 (48 bytes), for hits rebuilt from the visibility buffer. */
+    private Buffer instanceTransformBuffer;
+    private static final int INSTANCE_TRANSFORM_SIZE = 48;
+    /** Whether any instance is alpha-tested; the raster pass leaves those out and raygen tests them by ray. */
+    private boolean hasCutouts;
+    /** Reversed infinite-Z projection of the raster pass, and its product with the view and the overscan scale. */
+    private final Matrix4f rasterProj = new Matrix4f(), rasterViewProj = new Matrix4f();
+    /** Debug view that compares the raster pass with traced primary rays, see raygen.rgen. */
+    private static final int DEBUG_RASTER = 8;
+    /** Sets the strength of the denoiser's disocclusion fix, see {@link PostProcess#disocclusionFix}; 0 disables it. */
+    public void setDisocclusionFix(float strength) { post.disocclusionFix = Math.max(0f, strength); }
     /** Shader execution reordering for bounce rays, where supported and compiled in. */
     public boolean ser = true;
     /**
@@ -226,14 +285,14 @@ public final class Renderer implements AutoCloseable {
         cb.accept(r);
     }
 
-    // Copies the requested pixel of the meta image, offset by the overscan margin, into the pick buffer.
+    /** Records the copy of the requested pick pixel of the meta image, offset by the overscan border, to the host. */
     private void recordPickCopy(MemoryStack stack, int shown) {
         if (pickPending == null) return;
         int x = marginX + Math.clamp((long) ((pickPending[0] + 0.5f) * vW / fbW), 0, vW - 1);
         int y = marginY + Math.clamp((long) ((pickPending[1] + 0.5f) * vH / fbH), 0, vH - 1);
         VkMemoryBarrier.Buffer mb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT);
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(cmd, ctx.rtStage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, mb, null, null);
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
         region.get(0).imageSubresource().aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).layerCount(1);
@@ -257,7 +316,7 @@ public final class Renderer implements AutoCloseable {
     /** Keep the history when objects move and restart only their influence zones. */
     public boolean dynamicHistory = true;
 
-    private final long descriptorPool;
+    private long descriptorPool;
     /** {@code descriptorSets[p]} writes {@code history[p]} and reads {@code history[1 - p]}. */
     private final long[] descriptorSets = new long[2];
 
@@ -293,33 +352,42 @@ public final class Renderer implements AutoCloseable {
     public boolean reprojection = true;
     private Path pendingScreenshot;
 
+    /**
+     * Creates the Vulkan context on the best GPU (see {@link VkContext}), compiles the shaders, uploads the scene and
+     * builds its acceleration structures. Without hardware ray tracing only what the raster render mode needs is
+     * created. The environment variable {@code LUMVEX_DEFINES=NAME,NAME2} adds shader defines for experiments.
+     */
     public Renderer(RenderSurface window, Scene scene, boolean validation, boolean vsync) {
         this.window = window;
         this.scene = scene;
         this.vsync = vsync;
         ctx = new VkContext(window, validation);
-        System.out.println("[lumvex] GPU: " + ctx.deviceName
-                + " | SBT handle " + ctx.shaderGroupHandleSize + "B | max recursion " + ctx.maxRayRecursionDepth);
+        rt = ctx.rayTracingSupported;
+        System.out.println("[lumvex] GPU: " + ctx.deviceName + (rt
+                ? " | SBT handle " + ctx.shaderGroupHandleSize + "B | max recursion " + ctx.maxRayRecursionDepth
+                : " | no hardware ray tracing: rasterization only"));
+        if (!rt) renderMode = RenderMode.RASTER;
 
         compiler = new ShaderCompiler();
-        // Startup compiles 6 ray-tracing, 1 cache, 5 post-process, and 1 flare module.
-        int expectedShaderCount = 13 + (scene.textureCompression && ctx.textureCompressionBC && VirtualTextures.gpuEncode ? 1 : 0);
+        int expectedShaderCount = (rt ? 19 : 4) + (scene.textureCompression && ctx.textureCompressionBC && VirtualTextures.gpuEncode
+                && ctx.shaderInt64Supported ? 1 : 0);
         compiler.setProgressListener(expectedShaderCount, (shader, percent) -> window.shaderCompilationProgress(shader, percent));
         if (ctx.atomicFloatAddSupported) compiler.define("LUMVEX_CACHE", "1");
         else System.err.println("[lumvex] no float atomics on this GPU: speculative rendering disabled");
         if (ctx.invocationReorderSupported && compileSer) compiler.define("LUMVEX_SER", "1");
         else ser = false;
-        // LUMVEX_DEFINES=NAME,NAME2 adds shader defines for experiments.
         if (System.getenv("LUMVEX_DEFINES") != null) {
             for (String d : System.getenv("LUMVEX_DEFINES").split(",")) if (!d.isBlank()) compiler.define(d.trim(), "1");
         }
-        pipeline = new RtPipeline(ctx, compiler);
+        pipeline = rt ? new RtPipeline(ctx, compiler) : null;
+        raster = new RasterPrepass(ctx, compiler);
+        rasterShade = new RasterShade(ctx, compiler, RtPipeline.PUSH_CONSTANT_SIZE);
 
         vt = new VirtualTextures(ctx, scene.textureSets,
-                scene.textureSets.isEmpty() ? 1 : scene.texturePoolSlotsPerRow, scene.textureCompression, compiler);
+                scene.textureSets.isEmpty() ? 1 : texturePoolSlots(), scene.textureCompression, compiler);
         vt.similarityScale = scene.textureSimilarity;
 
-        cache = new RadianceCache(ctx, compiler);
+        cache = rt ? new RadianceCache(ctx, compiler) : null;
         post = new PostProcess(ctx, compiler);
 
         uiBuffer = new Buffer(ctx, 16 + 4 * 1024, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
@@ -348,17 +416,20 @@ public final class Renderer implements AutoCloseable {
         writeLights();
         updateDynamics(false);
         writeTlasInstances();
-        ctx.submitImmediate(c -> tlas.recordTopLevelBuild(c, tlasInstanceBuffer, scene.instances.size(), tlasScratchAddress));
+        writeRasterDraws();
+        if (rt) ctx.submitImmediate(c -> tlas.recordTopLevelBuild(c, tlasInstanceBuffer, scene.instances.size(), tlasScratchAddress, false));
+        tlasBuiltCount = scene.instances.size();
+        tlasRefits = 0;
         markSceneSeen();
-        System.out.printf("[lumvex] %d meshes, %d instances, %,d triangles, BLAS+TLAS built in %.1f ms%n",
+        System.out.printf("[lumvex] %d meshes, %d instances, %,d triangles, " + (rt ? "BLAS+TLAS built" : "uploaded") + " in %.1f ms%n",
                 scene.meshes.size(), scene.instances.size(), triangles, (System.nanoTime() - t0) / 1e6);
 
-        try (MemoryStack stack = stackPush()) {
+        if (rt) try (MemoryStack stack = stackPush()) {
             VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(4, stack);
             sizes.get(3).type(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(2 * 7);
             sizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(2);
-            sizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2 * 15);
-            sizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(2 * 12);
+            sizes.get(1).type(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(2 * 16);
+            sizes.get(2).type(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(2 * 16);
             LongBuffer lp = stack.mallocLong(2);
             check(vkCreateDescriptorPool(ctx.device, VkDescriptorPoolCreateInfo.calloc(stack)
                     .sType$Default().maxSets(2).pPoolSizes(sizes), null, lp), "vkCreateDescriptorPool");
@@ -370,7 +441,10 @@ public final class Renderer implements AutoCloseable {
                     "vkAllocateDescriptorSets");
             descriptorSets[0] = lp.get(0);
             descriptorSets[1] = lp.get(1);
-            writeSceneDescriptors();
+        }
+        writeSceneDescriptors();
+        try (MemoryStack stack = stackPush()) {
+            LongBuffer lp = stack.mallocLong(1);
 
             PointerBuffer pp = stack.mallocPointer(1);
             check(vkAllocateCommandBuffers(ctx.device, VkCommandBufferAllocateInfo.calloc(stack)
@@ -398,10 +472,14 @@ public final class Renderer implements AutoCloseable {
     /** One training path per trainBlock x trainBlock pixels; a train rate of 1/16 gives 4. */
     private int trainBlock() { return Math.max(1, Math.round((float) Math.sqrt(1.0 / Math.max(trainRate, 1e-4f)))); }
 
-    /** Light buffer header: uvec4(count, OPT_* bits, training block, cacheBounce | indirectShift << 8). */
+    /**
+     * Writes the per-frame part of the light buffer header: the OPT_* bits of raygen.rgen, the training block, the
+     * cache bounce and indirect shift, the prefetch guard band and shift, and the catch-up samples.
+     */
     private void writeLightOptions() {
         int bits = (lightImportance ? 1 : 0) | (cachePaths && ctx.atomicFloatAddSupported ? 2 : 0) | (restir ? 4 : 0)
-                | (ser && ctx.invocationReorderSupported ? 8 : 0) | (rayStats ? 16 : 0) | (lightGrid ? 32 : 0) | (cachePrior ? 64 : 0);
+                | (ser && ctx.invocationReorderSupported ? 8 : 0) | (rayStats ? 16 : 0) | (lightGrid ? 32 : 0) | (cachePrior ? 64 : 0)
+                | (rasterPrimary ? 128 : 0) | (hasCutouts ? 256 : 0);
         lightBuffer.map().putInt(4, bits).putInt(8, trainBlock()).putInt(12, cacheBounce | indirectShift << 8)
                 .putFloat(16, prefetch ? PREFETCH_GUARD : 1f).putFloat(20, prefetch ? prefetchShift[0] : 0f)
                 .putFloat(24, prefetch ? prefetchShift[1] : 0f).putInt(28, catchUpSamples);
@@ -426,12 +504,14 @@ public final class Renderer implements AutoCloseable {
     /** The radiance cache that paths end in; its fields tune how fast it follows changing light. */
     public RadianceCache radianceCache() { return cache; }
 
-    /** Discards the history and clears the radiance cache. Not needed for camera motion. */
+    /**
+     * Discards the pixel history and clears the radiance cache, whose light reflects the old settings. Not needed for
+     * camera motion, which reprojects the history.
+     */
     public void resetAccumulation() {
         accumulatedFrames = 0;
         historyValid = false;
-        // the cached light reflects the old settings
-        cache.clear();
+        if (cache != null) cache.clear();
     }
 
     /** Whether every pixel has reached the sample limit. */
@@ -468,17 +548,19 @@ public final class Renderer implements AutoCloseable {
         hasPrevForward = true;
     }
 
-    /** Uploads meshes added since the last call and builds their BLAS. Returns the number of new triangles. */
+    /**
+     * Uploads meshes added since the last call and builds their BLAS. Meshes replaced in place get new buffers once
+     * the GPU is idle; replaced meshes that were never uploaded are handled as new ones. Returns the number of new
+     * triangles.
+     */
     private long uploadNewMeshes() {
         long triangles = 0;
         if (!scene.replacedMeshes.isEmpty()) {
-            // Meshes replaced in place: free the old buffers and BLAS once the GPU is idle.
             vkDeviceWaitIdle(ctx.device);
             for (int i : scene.replacedMeshes) {
-                // not uploaded yet; handled below
                 if (i >= gpuMeshes.size()) continue;
                 GpuMesh old = gpuMeshes.get(i);
-                old.blas.close();
+                if (old.blas != null) old.blas.close();
                 old.vertices.close();
                 old.indices.close();
                 Mesh mesh = scene.meshes.get(i);
@@ -497,6 +579,7 @@ public final class Renderer implements AutoCloseable {
         return triangles;
     }
 
+    /** Uploads a mesh's vertices and indices to device memory and, with ray tracing, builds its BLAS. */
     private GpuMesh upload(Mesh mesh) {
         ByteBuffer vb = memAlloc(mesh.vertices.length * Float.BYTES);
         vb.asFloatBuffer().put(mesh.vertices);
@@ -506,8 +589,8 @@ public final class Renderer implements AutoCloseable {
         Buffer indices = Buffer.deviceLocal(ctx, ib, GEOMETRY_USAGE);
         memFree(vb);
         memFree(ib);
-        AccelerationStructure blas = AccelerationStructure.buildBottomLevel(ctx, vertices, mesh.vertexCount(),
-                Mesh.STRIDE, indices, mesh.triangleCount());
+        AccelerationStructure blas = rt ? AccelerationStructure.buildBottomLevel(ctx, vertices, mesh.vertexCount(),
+                Mesh.STRIDE, indices, mesh.triangleCount()) : null;
         return new GpuMesh(vertices, indices, blas);
     }
 
@@ -517,27 +600,40 @@ public final class Renderer implements AutoCloseable {
         return c;
     }
 
-    /** Grows the scene buffers and the TLAS as needed. Returns true if descriptors must be rewritten. */
+    /**
+     * Grows the instance, material and light buffers and the TLAS to the scene's size, doubling, and recreates the
+     * sun's flare pass, which binds the TLAS. Without ray tracing the composite pass gets an empty flare list instead.
+     * Returns true if the descriptors must be rewritten.
+     */
     private boolean ensureCapacities() {
         boolean realloc = false;
         int n = scene.instances.size();
-        if (n > instanceCapacity || tlas == null) {
-            if (tlas != null) {
+        if (n > instanceCapacity || instanceInfoBuffer == null) {
+            if (instanceInfoBuffer != null) {
                 vkDeviceWaitIdle(ctx.device);
-                tlas.close(); tlasScratch.close(); tlasInstanceBuffer.close(); instanceInfoBuffer.close(); deltaBuffer.close();
+                if (tlas != null) { tlas.close(); tlasScratch.close(); tlasInstanceBuffer.close(); }
+                instanceInfoBuffer.close(); deltaBuffer.close();
+                instanceTransformBuffer.close();
             }
             instanceCapacity = grow(n, 256);
             instanceInfoBuffer = new Buffer(ctx, (long) instanceCapacity * INSTANCE_INFO_SIZE, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
             deltaBuffer = new Buffer(ctx, (long) instanceCapacity * 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
-            tlasInstanceBuffer = new Buffer(ctx, (long) instanceCapacity * TLAS_INSTANCE_SIZE,
-                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                    Buffer.UPLOAD);
-            long[] scratchSize = new long[1];
-            tlas = AccelerationStructure.createTopLevel(ctx, tlasInstanceBuffer, instanceCapacity, scratchSize);
-            long align = ctx.minScratchOffsetAlignment;
-            tlasScratch = new Buffer(ctx, scratchSize[0] + align,
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, Buffer.DEVICE);
-            tlasScratchAddress = VkUtil.align(tlasScratch.address, align);
+            instanceTransformBuffer = new Buffer(ctx, (long) instanceCapacity * INSTANCE_TRANSFORM_SIZE,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
+            raster.setInstanceBuffers(instanceInfoBuffer, instanceTransformBuffer);
+            movedLastUpdate = null;
+            if (rt) {
+                tlasInstanceBuffer = new Buffer(ctx, (long) instanceCapacity * TLAS_INSTANCE_SIZE,
+                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        Buffer.UPLOAD);
+                long[] scratchSize = new long[1];
+                tlas = AccelerationStructure.createTopLevel(ctx, tlasInstanceBuffer, instanceCapacity, scratchSize);
+                tlasBuiltCount = -1;
+                long align = ctx.minScratchOffsetAlignment;
+                tlasScratch = new Buffer(ctx, scratchSize[0] + align,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, Buffer.DEVICE);
+                tlasScratchAddress = VkUtil.align(tlasScratch.address, align);
+            }
             realloc = true;
         }
         int m = scene.materials.size();
@@ -555,17 +651,24 @@ public final class Renderer implements AutoCloseable {
             memSet(lightBuffer.map(), 0);
             realloc = true;
         }
-        // the flare pass binds the TLAS and has one entry per light
-        if (realloc) {
+        if (realloc && rt) {
             if (flare != null) flare.close();
-            flare = new LensFlare(ctx, compiler, tlas.handle, lightCapacity + 1);
+            flare = new LensFlare(ctx, compiler, tlas.handle, 1);
             if (descriptorSets[0] != 0) post.updateFlareBuffer(flare.buffer);
+        }
+        if (!rt && noFlares == null) {
+            noFlares = new Buffer(ctx, 256, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
+            memSet(noFlares.map(), 0);
         }
         return realloc;
     }
 
-    /** Per instance: vertex and index buffer addresses, material and dynamic flag. */
+    /**
+     * Writes per instance the vertex and index buffer addresses, the material and the dynamic flag. The motion
+     * matrices and flags of all instances are rewritten on the next {@link #updateDynamics}.
+     */
     private void writeInstanceInfo() {
+        movedLastUpdate = null;
         ByteBuffer info = instanceInfoBuffer.map();
         for (int i = 0; i < scene.instances.size(); i++) {
             Scene.Instance inst = scene.instances.get(i);
@@ -608,7 +711,9 @@ public final class Renderer implements AutoCloseable {
 
     /**
      * Uploads scene changes since the last frame. Must run after the previous frame has finished. Restarts the
-     * image, except for soft changes, which only restart around the affected objects.
+     * image, except for soft changes (objects added, removed or recolored while playing), which only restart the
+     * influence zones of the changed objects. Lights that only moved keep the light grid: its lists only steer the
+     * choice, the exact weight is computed per shading point, and rebuilding thousands of cells per frame is costly.
      */
     private void applySceneChanges() {
         boolean structure = scene.structureRevision != seenStructure, transforms = scene.transformRevision != seenTransforms,
@@ -617,8 +722,6 @@ public final class Renderer implements AutoCloseable {
         boolean lightMoves = scene.lightMoveRevision != seenLightMoves;
         if (!(structure || transforms || lights || env || textures)) {
             if (lightMoves) {
-                // The grid is kept: its lists only steer the choice while the exact weight is computed per shading
-                // point, so moved lights are still sampled correctly. Rebuilding ~4000 cells per frame is costly.
                 writeLights(false);
                 seenLightMoves = scene.lightMoveRevision;
             }
@@ -630,7 +733,7 @@ public final class Renderer implements AutoCloseable {
             uploadAlphaMasks();
             vt.close();
             vt = new VirtualTextures(ctx, scene.textureSets,
-                    scene.textureSets.isEmpty() ? 1 : scene.texturePoolSlotsPerRow, scene.textureCompression, compiler);
+                    scene.textureSets.isEmpty() ? 1 : texturePoolSlots(), scene.textureCompression, compiler);
             vt.similarityScale = scene.textureSimilarity;
             realloc = true;
         }
@@ -646,6 +749,7 @@ public final class Renderer implements AutoCloseable {
         if (structure) {
             writeInstanceInfo();
             writeMaterials();
+            writeRasterDraws();
         }
         if (structure || lights) writeLights();
         if (structure || transforms) {
@@ -658,8 +762,6 @@ public final class Renderer implements AutoCloseable {
             writeSceneDescriptors();
         }
         markSceneSeen();
-        // Soft change (an object added, removed or recolored while playing): keep the image and restart only the
-        // influence zones of the changed objects.
         boolean soft = scene.softChange && !textures && !env && !realloc;
         scene.softChange = false;
         if (!soft) {
@@ -668,19 +770,28 @@ public final class Renderer implements AutoCloseable {
         }
     }
 
-    /** Rewrites the descriptors of all resources that can be replaced at runtime, for both parities. */
+    /**
+     * Rewrites the descriptors of all scene resources that can be replaced at runtime, for both parities of the ray
+     * tracing sets, and passes them to the raster passes.
+     */
     private void writeSceneDescriptors() {
         if (alphaMaskBuffer == null) uploadAlphaMasks();
+        rasterShade.writeScene(instanceInfoBuffer, materialBuffer, instanceTransformBuffer, vt, envTexture);
+        raster.setAlphaBuffers(materialBuffer, alphaMaskBuffer);
+        if (!rt) return;
         try (MemoryStack stack = stackPush()) {
             VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
                     .sType$Default()
                     .pAccelerationStructures(stack.longs(tlas.handle));
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(28, stack);
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(30, stack);
             VkDescriptorImageInfo.Buffer atlasInfo = VkDescriptorImageInfo.calloc(6, stack);
             for (int c = 0; c < 6; c++) atlasInfo.get(c).sampler(vt.sampler).imageView(vt.atlasView[c]).imageLayout(VK_IMAGE_LAYOUT_GENERAL);
             Buffer[] vtBuffers = {vt.pageTable, vt.feedback, vt.setInfo};
             for (int p = 0; p < 2; p++) {
                 long set = descriptorSets[p];
+                writes.get(28 + p).sType$Default().dstSet(set).dstBinding(31).descriptorCount(1)
+                        .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+                        .pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(instanceTransformBuffer.handle).range(VK_WHOLE_SIZE));
                 writes.get(26 + p).sType$Default().dstSet(set).dstBinding(25).descriptorCount(1)
                         .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
                         .pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(alphaMaskBuffer.handle).range(VK_WHOLE_SIZE));
@@ -749,21 +860,45 @@ public final class Renderer implements AutoCloseable {
         if (masks > 0) System.out.printf("[lumvex] alpha masks: %d texture sets with cut-outs (%.1f MB)%n", masks, words * 4 / 1048576.0);
     }
 
-    private void writeTlasInstances() {
+    /** Writes the TLAS instances and the matching object-to-world matrices for the raster primary surface. */
+    private void writeTlasInstances() { writeTlasInstances(false); }
+
+    /**
+     * TLAS mask of an instance: 0x01 opaque, 0x02 glass, 0x04 light proxies, 0x10 alpha-tested (leaves), plus 0x08
+     * for the raster pass's cutout rays. Shadow rays test 0x11; rays that skip leaves 0x01.
+     */
+    private static int instanceMask(Material mat) {
+        return mat.isLightProxy() ? 0x04 : mat.transmission() > 0.5f ? 0x02 : mat.isAlphaTested() ? 0x18 : 0x01;
+    }
+
+    /**
+     * Writes the object-to-world matrices (mat4x3, column-major) and, with ray tracing, the TLAS instances; with
+     * {@code movingOnly} only those of moving instances; the others are unchanged since the last full write. Only
+     * alpha-tested instances run the any-hit shader; all others are forced opaque.
+     */
+    private void writeTlasInstances(boolean movingOnly) {
         int n = scene.instances.size();
-        VkAccelerationStructureInstanceKHR.Buffer insts =
-                VkAccelerationStructureInstanceKHR.create(memAddress(tlasInstanceBuffer.map()), n);
+        VkAccelerationStructureInstanceKHR.Buffer insts = rt
+                ? VkAccelerationStructureInstanceKHR.create(memAddress(tlasInstanceBuffer.map()), n) : null;
+        ByteBuffer transforms = instanceTransformBuffer.map();
+        boolean cutouts = hasCutouts && movingOnly;
         for (int i = 0; i < n; i++) {
             Scene.Instance inst = scene.instances.get(i);
+            if (movingOnly && !inst.isDynamic()) continue;
+            for (int c = 0; c < 4; c++) {
+                for (int r = 0; r < 3; r++) {
+                    transforms.putFloat(i * INSTANCE_TRANSFORM_SIZE + (c * 3 + r) * 4, inst.transform.getRowColumn(r, c));
+                }
+            }
+            Material mat = scene.materials.get(inst.material);
+            cutouts |= mat.isAlphaTested();
+            if (!rt) continue;
             VkAccelerationStructureInstanceKHR vi = insts.get(i);
             VkTransformMatrixKHR t = vi.transform();
             for (int r = 0; r < 3; r++) {
                 for (int c = 0; c < 4; c++) t.matrix(r * 4 + c, inst.transform.getRowColumn(r, c));
             }
-            // Masks: 0x01 opaque, 0x02 glass, 0x04 light proxies. Shadow rays only test 0x01.
-            Material mat = scene.materials.get(inst.material);
-            int mask = mat.isLightProxy() ? 0x04 : mat.transmission() > 0.5f ? 0x02 : 0x01;
-            // Only cutouts run the any-hit shader; everything else is forced opaque.
+            int mask = instanceMask(mat);
             int flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR
                     | (mat.isAlphaTested() ? VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR : VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR);
             vi.instanceCustomIndex(i)
@@ -772,21 +907,44 @@ public final class Renderer implements AutoCloseable {
                     .flags(flags)
                     .accelerationStructureReference(gpuMeshes.get(inst.mesh).blas.address);
         }
+        hasCutouts = cutouts;
     }
 
-    /** Uploads swept boxes and influence radii of moving objects, and the per-instance motion matrices. */
+    /**
+     * Instances whose motion matrix and animated flag were written as moving in the last update; the others hold the
+     * identity and 0, so they are only rewritten when they start or stop moving. Reset to "unknown" (null) whenever the
+     * buffers are reallocated or the scene's structure changes.
+     */
+    private boolean[] movedLastUpdate;
+
+    /**
+     * Writes the per-instance motion matrices and the influence zones of what changed this frame (see
+     * {@link #dynamicBuffer}), at most {@link #MAX_DYNAMIC}:
+     * <ul>
+     * <li>moving instances: their swept box, padded a little for soft shadows. An emitter is approximated by a
+     * sphere of the same surface as its box (the half diagonal would turn a neon tube into a huge ball of light).
+     * Untextured instances only reproject their translation: they look the same wherever they turn, so a rolling ball
+     * keeps the history of the same lighting instead of dragging it along with the rotation;</li>
+     * <li>lights that moved, with the light's power;</li>
+     * <li>objects removed or changed by a soft rebuild, once at their old place; a removed emitter's power is
+     * unknown, so its whole zone restarts (power 0).</li>
+     * </ul>
+     */
     private void updateDynamics(boolean animated) {
         ByteBuffer dyn = dynamicBuffer.map();
         ByteBuffer delta = deltaBuffer.map();
         ByteBuffer info = instanceInfoBuffer.map();
         Matrix4f inv = new Matrix4f(), d = new Matrix4f();
         int count = 0;
-        for (int i = 0; i < scene.instances.size(); i++) {
+        int n = scene.instances.size();
+        boolean all = movedLastUpdate == null || movedLastUpdate.length < n;
+        if (all) movedLastUpdate = new boolean[Math.max(n, 1)];
+        for (int i = 0; i < n; i++) {
             Scene.Instance inst = scene.instances.get(i);
+            boolean moving = animated && inst.isDynamic();
+            if (!all && !moving && !movedLastUpdate[i]) continue;
+            movedLastUpdate[i] = moving;
             if (animated && inst.isDynamic() && scene.materials.get(inst.material).textureSet() < 0) {
-                // An untextured surface looks the same wherever it turns to; its shading depends on the world-space
-                // normal and position. Reprojecting only the translation keeps the history of a rolling ball or a
-                // spinning coin on the same lighting instead of dragging it along with the rotation.
                 Vector3f now = inst.transform.getTranslation(new Vector3f());
                 Vector3f before = inst.prevTransform.getTranslation(new Vector3f());
                 d.translation(before.sub(now));
@@ -798,8 +956,6 @@ public final class Renderer implements AutoCloseable {
             d.get(i * 64, delta);
             info.putInt(i * INSTANCE_INFO_SIZE + 20, animated && inst.isDynamic() ? 1 : 0);
             if (!animated || !inst.isDynamic() || count >= MAX_DYNAMIC) continue;
-
-            // Swept box: union of the previous and current bounds, padded a little for soft shadows.
             float[] b = meshBounds.get(inst.mesh);
             float[] box = {Float.MAX_VALUE, Float.MAX_VALUE, Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE, -Float.MAX_VALUE};
             for (Matrix4f m : new Matrix4f[]{inst.transform, inst.prevTransform}) {
@@ -815,14 +971,11 @@ public final class Renderer implements AutoCloseable {
             float emission = luminance(mat.emission());
             float power = 0;
             if (emission > 0) {
-                // Approximate the emitter by a sphere of the same surface as its box. The half diagonal would turn a
-                // thin, long emitter, such as a laser beam or a neon tube, into a huge ball of light.
                 float sx = box[3] - box[0], sy = box[4] - box[1], sz = box[5] - box[2];
                 power = (float) Math.PI * emission * (float) ((sx * sy + sy * sz + sx * sz) / (2 * Math.PI));
             }
             putZone(dyn, count++, box, 0.05f, zoneRadius(halfDiag, power), (power > 0 ? -1f : 1f) * (i + 1), power);
         }
-        // Lights that moved, with or without a glowing mesh: their own zone carries the light's power.
         for (int i = 0; i < scene.lights.size(); i++) {
             Scene.SphereLight l = scene.lights.get(i);
             Vector3f now = l.position();
@@ -839,11 +992,9 @@ public final class Renderer implements AutoCloseable {
             before.set(now);
         }
         while (previousLightPositions.size() > scene.lights.size()) previousLightPositions.remove(previousLightPositions.size() - 1);
-        // Objects removed or changed by a soft rebuild restart their old location once.
         for (float[] b : scene.changedBoxes) {
             if (!animated || count >= MAX_DYNAMIC) break;
             float halfDiag = 0.5f * (float) Math.sqrt(sq(b[3] - b[0]) + sq(b[4] - b[1]) + sq(b[5] - b[2]));
-            // The power of a removed emitter is unknown: 0 makes the shader restart its whole zone.
             putZone(dyn, count++, b, 0.05f, Math.min(12f, b[6] > 0 ? 4f * halfDiag + 1f : 1.5f * halfDiag),
                     b[6] > 0 ? -0.5f : 0.5f, 0);
         }
@@ -931,7 +1082,11 @@ public final class Renderer implements AutoCloseable {
         return (float) Math.min(1, Math.sqrt(AUTO_PIXEL_BUDGET / ((double) width * height)));
     }
 
-    /** (Re)creates the swapchain and all size-dependent images and rebinds them. Restarts the image. */
+    /**
+     * (Re)creates the swapchain and all images that depend on the window size (history, filter, output and
+     * visibility images, sized for the render scale plus the overscan border) and rebinds them. The filtered
+     * histories are cleared, alpha 0 marking "no history yet". Restarts the image.
+     */
     private void createSizeDependent(long oldSwapchain) {
         int[] fb = window.framebufferSize();
         swapchain = window.headless() ? null : new Swapchain(ctx, fb[0], fb[1], vsync, oldSwapchain);
@@ -942,6 +1097,7 @@ public final class Renderer implements AutoCloseable {
         vH = Math.max(1, Math.round(fbH * scale));
         marginX = Math.round(vW * overscan / 2);
         marginY = Math.round(vH * overscan / 2);
+
         rW = vW + 2 * marginX;
         rH = vH + 2 * marginY;
         overscanScale.scaling((float) vW / rW, (float) vH / rH, 1f);
@@ -953,19 +1109,16 @@ public final class Renderer implements AutoCloseable {
             history[p] = new PostProcess.HistoryImages(
                     new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
                     new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
-                    // Half precision is enough here and halves the bandwidth of the filter taps.
                     new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT),
                     new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
                     new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT),
-                    // specular share
                     new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT),
-                    // specular albedo, roughness
                     new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT));
         }
         for (int p = 0; p < 2; p++) reservoir[p] = new StorageImage(ctx, w, h, VK_FORMAT_R32G32B32A32_SFLOAT);
         for (int p = 0; p < 2; p++) filtered[p] = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
+        raster.resize(w, h);
         for (int p = 0; p < 2; p++) specFiltered[p] = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
-        // alpha 0 marks "no filtered history yet"
         ctx.submitImmediate(c -> {
             try (MemoryStack st = stackPush()) {
                 VkClearColorValue zero = VkClearColorValue.calloc(st);
@@ -978,20 +1131,19 @@ public final class Renderer implements AutoCloseable {
         pingB = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
         specPingA = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
         specPingB = new StorageImage(ctx, w, h, VK_FORMAT_R16G16B16A16_SFLOAT);
-        // visible part only
         outputImage = new StorageImage(ctx, fbW, fbH, VK_FORMAT_R8G8B8A8_UNORM);
         readback = new Buffer(ctx, (long) fbW * fbH * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, Buffer.READBACK);
 
-        try (MemoryStack stack = stackPush()) {
-            // 2 sets x 15 images
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(30, stack);
+        if (rt) try (MemoryStack stack = stackPush()) {
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(32, stack);
             int i = 0;
             for (int p = 0; p < 2; p++) {
                 PostProcess.HistoryImages cur = history[p], prev = history[1 - p];
                 StorageImage[] images = {cur.color(), cur.guideNormalDepth(), cur.guideAlbedo(), cur.meta(),
                         prev.color(), prev.guideNormalDepth(), prev.guideAlbedo(), prev.meta(), cur.motion(),
-                        reservoir[p], reservoir[1 - p], cur.specular(), prev.specular(), cur.specGuide(), prev.specGuide()};
-                int[] bindings = {1, 2, 5, 6, 7, 8, 9, 10, 12, 23, 24, 26, 27, 28, 29};
+                        reservoir[p], reservoir[1 - p], cur.specular(), prev.specular(), cur.specGuide(), prev.specGuide(),
+                        raster.visibility};
+                int[] bindings = {1, 2, 5, 6, 7, 8, 9, 10, 12, 23, 24, 26, 27, 28, 29, 30};
                 for (int k = 0; k < images.length; k++) {
                     writes.get(i++).sType$Default().dstSet(descriptorSets[p]).dstBinding(bindings[k]).descriptorCount(1)
                             .descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
@@ -1000,8 +1152,10 @@ public final class Renderer implements AutoCloseable {
             }
             vkUpdateDescriptorSets(ctx.device, writes, null);
         }
-        post.updateDescriptors(history, pingA, pingB, outputImage, flare.buffer, filtered, uiBuffer, specPingA, specPingB, specFiltered);
-        flare.resetHistory();
+        post.updateDescriptors(history, pingA, pingB, outputImage, rt ? flare.buffer : noFlares, filtered, uiBuffer,
+                specPingA, specPingB, specFiltered);
+        rasterShade.writeImages(history, raster.visibility);
+        if (rt) flare.resetHistory();
         resetAccumulation();
     }
 
@@ -1054,6 +1208,10 @@ public final class Renderer implements AutoCloseable {
     /** Number of TLAS builds; moving instances cause one per frame. */
     public int tlasBuilds() { return tlasBuilds; }
 
+    /**
+     * Reads the GPU timestamps of the last frame into {@link #lastGpuMs} and the smoothed times, and prints them every
+     * 30 frames with {@code -Dlumvex.gputimes=true}.
+     */
     private void readTimestamps(MemoryStack stack) {
         if (!timestampsPending) return;
         timestampsPending = false;
@@ -1068,7 +1226,14 @@ public final class Renderer implements AutoCloseable {
         gpuTrainMs = smooth(gpuTrainMs, lastGpuMs[3]);
         gpuDenoiseMs = smooth(gpuDenoiseMs, lastGpuMs[1]);
         gpuTotalMs = smooth(gpuTotalMs, lastGpuMs[2]);
+        if (GPU_TIMES && frameCounter % 30 == 0) {
+            System.out.printf("[gpu] raster+train %.1f ms, trace %.1f ms, denoise %.1f ms, total %.1f ms%n",
+                    gpuTrainMs, gpuTraceMs - gpuTrainMs, gpuDenoiseMs, gpuTotalMs);
+        }
     }
+
+    /** {@code -Dlumvex.gputimes=true} prints the smoothed GPU times of the passes every 30 frames. */
+    private static final boolean GPU_TIMES = Boolean.getBoolean("lumvex.gputimes");
 
     private static double smooth(double old, double value) {
         return old == 0 ? value : old * 0.9 + value * 0.1;
@@ -1108,7 +1273,13 @@ public final class Renderer implements AutoCloseable {
         }
     }
 
-    /** Renders and presents one frame. */
+    /**
+     * Renders and presents one frame: waits for the previous one, uploads scene and UI changes, updates motion and
+     * influence zones, records and submits the frame and presents it. With {@code animated} objects moved this frame;
+     * their history is kept and only their influence zones restart. Camera motion keeps the history through
+     * reprojection and only restarts the still-camera counter. At the sample limit nothing is traced and only the
+     * denoiser and the composite run, which keeps the UI live.
+     */
     public void render(Camera camera, boolean animated) {
         try (MemoryStack stack = stackPush()) {
             long s0 = System.nanoTime();
@@ -1140,10 +1311,12 @@ public final class Renderer implements AutoCloseable {
             readRayStats();
             writeLightOptions();
 
+            if (rasterDrawsMode != renderMode) {
+                vkDeviceWaitIdle(ctx.device);
+                writeRasterDraws();
+            }
             if (animated) {
-                // the previous frame has finished, so the buffer is free
-                writeTlasInstances();
-                // history is kept; only influence zones restart
+                writeTlasInstances(true);
                 if (dynamicHistory) accumulatedFrames = 0;
                 else resetAccumulation();
             }
@@ -1151,7 +1324,6 @@ public final class Renderer implements AutoCloseable {
             updateDynamics(animated && dynamicHistory);
             lastCpuMs[3] = (System.nanoTime() - d0) / 1e6;
 
-            // With reprojection the history survives camera motion; only the still-camera counter restarts.
             camera.viewProjection((float) fbW / fbH, viewProjShown);
             overscanScale.mul(viewProjShown, viewProj);
             currentCamera = camera;
@@ -1161,7 +1333,6 @@ public final class Renderer implements AutoCloseable {
                 else resetAccumulation();
             }
 
-            // At the sample limit only denoise and composite run, which keeps the overlay live.
             boolean trace = !idle();
             updatePrefetchShift(camera);
             int flags = (historyValid ? 1 : 0) | (moved ? 2 : 0)
@@ -1172,7 +1343,6 @@ public final class Renderer implements AutoCloseable {
             vkResetCommandBuffer(cmd, 0);
             vkBeginCommandBuffer(cmd, VkCommandBufferBeginInfo.calloc(stack).sType$Default()
                     .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT));
-            // A traced frame writes history[parity]; an idle frame shows the last one written.
             int shown = trace ? parity : 1 - parity;
             long r0 = System.nanoTime();
             if (animated || tlasDirty) tlasBuilds++;
@@ -1228,6 +1398,21 @@ public final class Renderer implements AutoCloseable {
         }
     }
 
+    /**
+     * Records a frame into the command buffer:
+     * <ol>
+     * <li>the TLAS build, or a refit when only transforms changed (a full build after a structure change and every
+     * {@link #REFIT_LIMIT} refits);</li>
+     * <li>texture streaming, then the raster pre-pass in the hybrid and raster modes;</li>
+     * <li>the raster mode's shading pass, or the radiance cache training pass (a few full paths, whose camera rays
+     * also cover a guard band that prefetches texture tiles around the view), the cache resolve and the path
+     * tracer;</li>
+     * <li>the denoiser and, on traced frames, which write motion vectors, the temporal filters; the specular filter by
+     * reflection footprint;</li>
+     * <li>pick copy, lens flares, composite, the blit to the swapchain image and the screenshot copy.</li>
+     * </ol>
+     * A traced frame writes {@code history[parity]}; {@code shown} is the history displayed.
+     */
     private void recordFrame(MemoryStack stack, int imageIndex, boolean rebuildTlas, boolean trace, int shown, int flags,
                              boolean screenshot, Camera camera) {
         long swapImage = swapchain != null ? swapchain.images[imageIndex] : VK_NULL_HANDLE;
@@ -1236,24 +1421,27 @@ public final class Renderer implements AutoCloseable {
         vkCmdResetQueryPool(cmd, queryPool, 0, TS_COUNT);
         timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TS_START);
 
-        if (trace) cache.recordClear(cmd, stack);
+        boolean rasterOnly = renderMode == RenderMode.RASTER;
+        if (trace && cache != null) cache.recordClear(cmd, stack);
 
-        if (rebuildTlas) {
-            tlas.recordTopLevelBuild(cmd, tlasInstanceBuffer, scene.instances.size(), tlasScratchAddress);
+        if (rebuildTlas && rt) {
+            boolean refit = !tlasDirty && tlasBuiltCount == scene.instances.size() && tlasRefits < REFIT_LIMIT;
+            tlas.recordTopLevelBuild(cmd, tlasInstanceBuffer, scene.instances.size(), tlasScratchAddress, refit);
+            tlasRefits = refit ? tlasRefits + 1 : 0;
+            tlasBuiltCount = scene.instances.size();
             VkMemoryBarrier.Buffer mb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                     .srcAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR)
                     .dstAccessMask(VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR);
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-                    VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, mb, null, null);
+                    ctx.rtStage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, mb, null, null);
         }
 
-        // Order last frame's writes and blit reads before this frame's shader accesses.
         VkMemoryBarrier.Buffer frameBarrier = VkMemoryBarrier.calloc(1, stack).sType$Default()
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
                 .dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         vkCmdPipelineBarrier(cmd,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                ctx.rtStage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                ctx.rtStage | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0, frameBarrier, null, null);
 
         long v0 = System.nanoTime();
@@ -1261,15 +1449,18 @@ public final class Renderer implements AutoCloseable {
         lastCpuMs[4] = (System.nanoTime() - v0) / 1e6;
 
         timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TS_TRACE_BEGIN);
-        if (trace) {
+        if (trace && (rasterPrimary || debugMode == DEBUG_RASTER)) recordRaster(stack, camera);
+        if (trace && rasterOnly) {
+            writePushConstants(camera, (float) fbW / fbH, flags);
+            timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TS_TRAIN_END);
+            rasterShade.record(cmd, stack, parity, w, h, pushConstants);
+            vt.recordFeedbackReadback(cmd, stack);
+        } else if (trace) {
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline.pipelineLayout, 0,
                     stack.longs(descriptorSets[parity]), null);
             writePushConstants(camera, (float) fbW / fbH, flags);
             vkCmdPushConstants(cmd, pipeline.pipelineLayout, RT_STAGES, 0, pushConstants);
-
-            // Training pass: a few full-length paths fill the radiance cache that the main pass terminates in.
-            // Its camera rays also cover a guard band, which prefetches texture tiles around the view.
             if ((cachePaths || prefetch) && ctx.atomicFloatAddSupported) {
                 int b = trainBlock();
                 float g = prefetch ? PREFETCH_GUARD : 1f;
@@ -1277,42 +1468,38 @@ public final class Renderer implements AutoCloseable {
                         (int) Math.ceil(w * g / b), (int) Math.ceil(h * g / b), 1);
                 VkMemoryBarrier.Buffer tb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                         .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT).dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                vkCmdPipelineBarrier(cmd, ctx.rtStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         0, tb, null, null);
-                // Blend the new samples into the cells the image pass reads.
                 cache.recordResolve(cmd, stack, (flags & FLAG_ANIMATED) != 0);
-                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, ctx.rtStage,
                         0, tb, null, null);
             }
-            timestamp(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, TS_TRAIN_END);
+            timestamp(ctx.rtStage, TS_TRAIN_END);
             vkCmdTraceRaysKHR(cmd, pipeline.raygenRegion, pipeline.missRegion, pipeline.hitRegion, pipeline.callableRegion, w, h, 1);
-            // Read back by the host after the fence.
             vt.recordFeedbackReadback(cmd, stack);
         } else {
             timestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, TS_TRAIN_END);
         }
-        timestamp(VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, TS_TRACE_END);
+        timestamp(ctx.rtStage, TS_TRACE_END);
 
         VkMemoryBarrier.Buffer rtToCompute = VkMemoryBarrier.calloc(1, stack).sType$Default()
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
                 .dstAccessMask(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        vkCmdPipelineBarrier(cmd, ctx.rtStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0, rtToCompute, null, null);
         int source = 0;
         int framesInImage = Math.max(1, trace ? accumulatedFrames + 1 : accumulatedFrames);
         int iterations = effectiveDenoiseIterations(framesInImage);
-        if (((denoise && debugMode == 0) || debugMode == 3) && iterations > 0) {
-            source = post.recordDenoise(cmd, stack, shown, w, h, sampleLimit, iterations);
+        if (((denoise && debugMode == 0) || debugMode == 3) && iterations > 0 && !rasterOnly) {
+            source = post.recordDenoise(cmd, stack, shown, w, h, sampleLimit, iterations, frameCounter);
             PostProcess.computeBarrier(cmd, stack);
-            // The temporal stage needs this frame's motion vectors, which only traced frames write.
             if (post.temporal && debugMode == 0 && trace) {
                 source = post.recordTemporal(cmd, stack, shown, w, h, source);
                 PostProcess.computeBarrier(cmd, stack);
             }
         }
-        // The specular share, filtered by its reflection footprint; 0 composites the raw specular history.
         int specularSource = 0;
-        if (post.specularFilter && denoise && debugMode == 0 && iterations > 0) {
+        if (post.specularFilter && denoise && debugMode == 0 && iterations > 0 && !rasterOnly) {
             float pixelAngle = 2f * (float) Math.tan(Math.toRadians(camera.fovYDegrees) / 2) / vH;
             specularSource = post.recordSpecular(cmd, stack, shown, w, h, iterations, pixelAngle, (flags & FLAG_CAMERA_MOVED) != 0);
             PostProcess.computeBarrier(cmd, stack);
@@ -1325,9 +1512,8 @@ public final class Renderer implements AutoCloseable {
         recordPickCopy(stack, shown);
         recordFlares(stack);
         post.recordComposite(cmd, stack, shown, fbW, fbH, (float) vW / fbW, (float) vH / fbH, marginX, marginY, exposure, debugMode, source,
-                specularSource, sampleLimit, debugMode == 0 ? flareStrength : 0f);
+                specularSource, sampleLimit, debugMode == 0 ? flareStrength : 0f, hazeConstants());
         w = fbW;
-        // blit and screenshot use the visible image
         h = fbH;
 
         imageBarrier(stack, outputImage.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
@@ -1366,12 +1552,101 @@ public final class Renderer implements AutoCloseable {
         timestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, TS_END);
     }
 
-    /** Collects flare sources and records their visibility pass. */
+    /**
+     * Rebuilds the raster pass's draw list for the current render mode: instances grouped by mesh, one indirect draw
+     * per group, opaque groups first. The raster mode adds the alpha-tested instances as groups of their own, drawn
+     * with the alpha test, and leaves out glass, which it cannot look through; the other modes leave cutouts to the
+     * ray tracer. Runs when the structure or the render mode changes; moved instances only need their transforms.
+     */
+    private void writeRasterDraws() {
+        rasterDrawsMode = renderMode;
+        boolean rasterOnly = renderMode == RenderMode.RASTER;
+        int n = scene.instances.size(), meshes = scene.meshes.size();
+        int[] slotOf = new int[n];
+        int[] perSlot = new int[2 * meshes + 1];
+        for (int i = 0; i < n; i++) {
+            Scene.Instance inst = scene.instances.get(i);
+            Material mat = scene.materials.get(inst.material);
+            int slot = mat.isAlphaTested() ? (rasterOnly ? meshes + inst.mesh : -1)
+                     : rasterOnly && mat.transmission() > 0.5f ? -1 : inst.mesh;
+            slotOf[i] = slot;
+            if (slot >= 0) perSlot[slot + 1]++;
+        }
+        int[] start = new int[2 * meshes + 1];
+        List<MeshLod> groupLods = new ArrayList<>();
+        float[] bounds = new float[6 * Math.max(2 * meshes, 1)];
+        int groups = 0, offset = 0, opaqueGroups = 0;
+        int[] groupOf = new int[2 * meshes];
+        for (int s = 0; s < 2 * meshes; s++) {
+            if (s == meshes) opaqueGroups = groups;
+            if (perSlot[s + 1] == 0) { groupOf[s] = -1; continue; }
+            int m = s % meshes;
+            groupOf[s] = groups;
+            start[groups] = offset;
+            groupLods.add(MeshLod.of(scene.meshes.get(m)));
+            System.arraycopy(meshBounds.get(m), 0, bounds, 6 * groups, 6);
+            offset += perSlot[s + 1];
+            groups++;
+        }
+        if (meshes == 0) opaqueGroups = groups;
+        start[groups] = offset;
+        int[] list = new int[Math.max(offset, 1)], fill = java.util.Arrays.copyOf(start, Math.max(groups, 1));
+        for (int i = 0; i < n; i++) if (slotOf[i] >= 0) list[fill[groupOf[slotOf[i]]]++] = i;
+        MeshLod.retain(scene.meshes);
+        raster.setDraws(list, offset, start, groupLods, bounds, groups, opaqueGroups);
+    }
+
+    /** The render mode the raster draw list was built for; it is rebuilt when the mode changes. */
+    private RenderMode rasterDrawsMode;
+
+    /**
+     * Records the raster pre-pass into the visibility buffer, with the traced image's frustum (including the overscan
+     * border) and reversed infinite depth. Passes the screen pixels per radian at the image center, by which the
+     * culling pass chooses levels of detail.
+     */
+    private void recordRaster(MemoryStack stack, Camera camera) {
+        rasterProj.setPerspective((float) Math.toRadians(camera.fovYDegrees), (float) fbW / fbH, Float.POSITIVE_INFINITY, 0.01f, true);
+        overscanScale.mul(rasterProj, rasterViewProj).mul(camera.view());
+        float pixelsPerRadian = 0.5f * rH * rasterProj.m11() * (float) vH / rH;
+        raster.record(cmd, stack, rasterViewProj, camera.position, pixelsPerRadian);
+    }
+
+    private final float[] haze = new float[20];
+    private final Vector3f hazeTmp = new Vector3f();
+
+    /** Push constants of the aerial perspective: haze color and density, sun, camera height and basis. */
+    private float[] hazeConstants() {
+        Scene s = scene;
+        float sun = s.sunDirection.y > -0.1f ? s.sunIntensity * s.hazeSun : 0f;
+        float[] v = {s.hazeColor.x, s.hazeColor.y, s.hazeColor.z, s.hazeDensity,
+                s.sunColor.x * sun, s.sunColor.y * sun, s.sunColor.z * sun, s.hazeFalloff,
+                s.sunDirection.x, s.sunDirection.y, s.sunDirection.z, currentCamera.position.y};
+        System.arraycopy(v, 0, haze, 0, 12);
+        currentCamera.forward(hazeTmp);
+        haze[12] = hazeTmp.x; haze[13] = hazeTmp.y; haze[14] = hazeTmp.z; haze[15] = 0f;
+        float tanX = (float) Math.tan(Math.toRadians(currentCamera.fovYDegrees) / 2) * fbW / Math.max(fbH, 1);
+        currentCamera.right(hazeTmp).normalize().mul(tanX);
+        haze[16] = hazeTmp.x; haze[17] = hazeTmp.y; haze[18] = hazeTmp.z; haze[19] = 0f;
+        return haze;
+    }
+
+    /** VRAM for the virtual texture pools in MB when the scene leaves their size to the engine. */
+    private static final long TEXTURE_POOL_MB = Long.getLong("lumvex.texturepool", 3072);
+
+    /** Slots per row of each virtual texture pool: the scene's choice, or as many as fit the VRAM budget. */
+    private int texturePoolSlots() {
+        if (scene.texturePoolSlotsPerRow > 0) return scene.texturePoolSlotsPerRow;
+        int slots = VirtualTextures.slotsForBudget(TEXTURE_POOL_MB << 20, scene.textureCompression && ctx.textureCompressionBC,
+                ctx.maxImageDimension2D);
+        System.out.printf("[lumvex] texture pools: %d x %d slots per pool%n", slots, slots);
+        return slots;
+    }
+
+    /** Adds the sun as flare source and records its visibility pass. Point lights have no flares, see LensFlare. */
     private void recordFlares(MemoryStack stack) {
+        if (!rt) return;
         flare.begin();
         if (flareStrength > 0 && debugMode == 0) {
-            Vector3f cam = currentCamera.position;
-            for (Scene.SphereLight l : scene.lights) flare.addPoint(l.position(), l.radius(), l.radiance(), cam);
             if (scene.sunIntensity > 0 && scene.sunDirection.y > -0.02f) {
                 flare.addDirectional(scene.sunDirection, 0.0047f,
                         new Vector3f(scene.sunColor).mul(scene.sunIntensity * SUN_FLARE));
@@ -1445,19 +1720,22 @@ public final class Renderer implements AutoCloseable {
         destroySizeDependent(true);
         vkDestroyFence(ctx.device, inFlight, null);
         vkDestroySemaphore(ctx.device, imageAvailable, null);
-        vkDestroyDescriptorPool(ctx.device, descriptorPool, null);
-        tlas.close();
-        tlasScratch.close();
-        tlasInstanceBuffer.close();
+        if (rt) {
+            vkDestroyDescriptorPool(ctx.device, descriptorPool, null);
+            tlas.close();
+            tlasScratch.close();
+            tlasInstanceBuffer.close();
+        }
         materialBuffer.close();
         instanceInfoBuffer.close();
+        instanceTransformBuffer.close();
         for (GpuMesh m : gpuMeshes) {
-            m.blas.close();
+            if (m.blas != null) m.blas.close();
             m.vertices.close();
             m.indices.close();
         }
         vkDestroyQueryPool(ctx.device, queryPool, null);
-        cache.close();
+        if (cache != null) cache.close();
         vt.close();
         dynamicBuffer.close();
         lightBuffer.close();
@@ -1467,9 +1745,12 @@ public final class Renderer implements AutoCloseable {
         deltaBuffer.close();
         uiBuffer.close();
         pickBuffer.close();
-        flare.close();
+        if (flare != null) flare.close();
+        if (noFlares != null) noFlares.close();
         post.close();
-        pipeline.close();
+        rasterShade.close();
+        raster.close();
+        if (pipeline != null) pipeline.close();
         compiler.close();
         memFree(pushConstants);
         ctx.close();
