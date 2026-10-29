@@ -106,6 +106,7 @@ public final class Material {
         return copy(def);
     }
 
+    /** A deep copy of a material definition. */
     private static MaterialDef copy(MaterialDef s) {
         MaterialDef d = new MaterialDef();
         d.albedo = s.albedo.clone();
@@ -117,6 +118,7 @@ public final class Material {
         d.textures = s.textures;
         d.uvScale = s.uvScale;
         d.normalStrength = s.normalStrength;
+        d.parallax = s.parallax;
         d.lightProxy = s.lightProxy;
         return d;
     }

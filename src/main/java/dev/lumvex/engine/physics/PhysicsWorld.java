@@ -50,6 +50,8 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
     /** Distance kept from a contact after a blocked move; larger than the uncertainty of the contact test. */
     private static final float CONTACT_GAP = 0.005f;
     private static boolean joltReady;
+    /** Most Jolt bodies; {@code -Dlumvex.maxbodies} raises it further. */
+    private static final int MAX_BODIES = Integer.getInteger("lumvex.maxbodies", 65536);
 
     private final SceneBuilder builder;
     private final SceneQuery query;
@@ -65,6 +67,76 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
     private final Map<String, Integer> instanceSig = new HashMap<>();
     /** Bodies of instanced copies by owning entity, so moving the owner moves its copies. */
     private final Map<String, List<Body>> byOwner = new HashMap<>();
+    /** Bodies by position, for collision queries; see {@link Grid}. */
+    private final Grid grid = new Grid();
+    /** Children of each entity, for moving whole hierarchies; rebuilt by {@link #sync}. */
+    private final Map<String, List<String>> children = new HashMap<>();
+    /** Bodies flagged {@code moved} in the last step, so the flags can be cleared without visiting every body. */
+    private final List<Body> movedBodies = new ArrayList<>();
+    private int dynamicCount;
+    /** Contact partners per body id, so a body that moves away from a contact still reports its end. */
+    private final Map<String, Set<String>> partners = new HashMap<>();
+
+    /**
+     * A uniform grid of {@link #CELL} meters over the bodies' bounding boxes in x and z, so collision queries only
+     * test the bodies near them. Bodies wider than {@link #LARGE} (ground plates, long walls) are kept in one list
+     * and always returned.
+     */
+    private static final class Grid {
+        static final float CELL = 8f, LARGE = 96f;
+        final Map<Long, List<Body>> cells = new HashMap<>();
+        final List<Body> large = new ArrayList<>();
+        int query;
+
+        /** Map key of the cell at x, z. */
+        static long key(int x, int z) { return ((long) x << 32) ^ (z & 0xffffffffL); }
+
+        /** Empties the grid. */
+        void clear() { cells.clear(); large.clear(); }
+
+        /** Files a body under every cell its bounding box touches, or in the list of large bodies. */
+        void insert(Body b) {
+            float[] a = b.aabb;
+            if (a[3] - a[0] > LARGE || a[5] - a[2] > LARGE) { large.add(b); b.cells = null; return; }
+            int x0 = (int) Math.floor(a[0] / CELL), x1 = (int) Math.floor(a[3] / CELL);
+            int z0 = (int) Math.floor(a[2] / CELL), z1 = (int) Math.floor(a[5] / CELL);
+            long[] keys = new long[(x1 - x0 + 1) * (z1 - z0 + 1)];
+            int k = 0;
+            for (int x = x0; x <= x1; x++) for (int z = z0; z <= z1; z++) {
+                keys[k++] = key(x, z);
+                cells.computeIfAbsent(key(x, z), q -> new ArrayList<>()).add(b);
+            }
+            b.cells = keys;
+        }
+
+        /** Removes a body from the cells it is filed under. */
+        void remove(Body b) {
+            if (b.cells == null) { large.remove(b); return; }
+            for (long key : b.cells) {
+                List<Body> l = cells.get(key);
+                if (l != null) l.remove(b);
+            }
+            b.cells = null;
+        }
+
+        /** Re-files a body whose bounding box changed. */
+        void update(Body b) { remove(b); insert(b); }
+
+        /** The bodies whose cells overlap the box grown by {@code margin}, each once. */
+        List<Body> near(float[] box, float margin) {
+            List<Body> out = new ArrayList<>(large);
+            int q = ++query;
+            for (Body b : large) b.stamp = q;
+            int x0 = (int) Math.floor((box[0] - margin) / CELL), x1 = (int) Math.floor((box[3] + margin) / CELL);
+            int z0 = (int) Math.floor((box[2] - margin) / CELL), z1 = (int) Math.floor((box[5] + margin) / CELL);
+            for (int x = x0; x <= x1; x++) for (int z = z0; z <= z1; z++) {
+                List<Body> l = cells.get(key(x, z));
+                if (l == null) continue;
+                for (Body b : l) if (b.stamp != q) { b.stamp = q; out.add(b); }
+            }
+            return out;
+        }
+    }
 
     private PhysicsSystem system;
     private BodyInterface bi;
@@ -104,6 +176,10 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
         String owner;
         /** An instanced copy: always static, and copies never report contacts with each other. */
         boolean instance;
+        /** Grid cells the body is filed under (see {@link Grid}); null for bodies in the grid's list of large ones. */
+        long[] cells;
+        /** Last query that returned this body, so a body in several cells is returned once. */
+        int stamp;
 
         Body(String id, ColliderComponent c, boolean mesh, float[] local) {
             this.id = id;
@@ -119,6 +195,11 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
         boolean blocking() { return !c.trigger && !dynamic(); }
     }
 
+    /**
+     * Sets up Jolt with two object layers, moving and static, where static bodies are never tested against each
+     * other. Large levels need tens of thousands of static bodies, which cost no pairs, so the pair and contact
+     * budgets only grow with the moving ones. Without Jolt only the engine's own collision tests run.
+     */
     public PhysicsWorld(SceneBuilder builder, SceneQuery query) {
         this.builder = builder;
         this.query = query;
@@ -127,7 +208,6 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
             temp = new TempAllocatorMalloc();
             jobs = new JobSystemThreadPool(Jolt.cMaxPhysicsJobs, Jolt.cMaxPhysicsBarriers,
                     Math.max(1, Runtime.getRuntime().availableProcessors() - 2));
-            // Two layers; static bodies never need to be tested against each other.
             ObjectLayerPairFilterTable ovo = new ObjectLayerPairFilterTable(2);
             ovo.enableCollision(LAYER_MOVING, LAYER_MOVING);
             ovo.enableCollision(LAYER_MOVING, LAYER_STATIC);
@@ -137,7 +217,7 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
             bpl.mapObjectToBroadPhaseLayer(LAYER_STATIC, 1);
             ObjectVsBroadPhaseLayerFilterTable ovb = new ObjectVsBroadPhaseLayerFilterTable(bpl, 2, ovo, 2);
             system = new PhysicsSystem();
-            system.init(8192, 0, 16384, 8192, bpl, ovb, ovo);
+            system.init(MAX_BODIES, 0, 65536, 16384, bpl, ovb, ovo);
             system.setGravity(gravity[0], gravity[1], gravity[2]);
             bi = system.getBodyInterface();
         } catch (Throwable t) {
@@ -225,6 +305,14 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
         instanceSig.keySet().removeIf(id -> doc.find(id) == null);
         byOwner.clear();
         for (Body b : bodies.values()) if (b.instance) byOwner.computeIfAbsent(b.owner, k -> new ArrayList<>()).add(b);
+        children.clear();
+        for (Entity e : doc.entities) if (e.parent != null) children.computeIfAbsent(e.parent, k -> new ArrayList<>()).add(e.id);
+        grid.clear();
+        dynamicCount = 0;
+        for (Body b : bodies.values()) {
+            grid.insert(b);
+            if (b.dynamic()) dynamicCount++;
+        }
         if (added && system != null) system.optimizeBroadPhase();
     }
 
@@ -255,6 +343,20 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
         return b;
     }
 
+    /** Geometry already hulled, by content: in a level, thousands of colliders share a few dozen shapes. */
+    private record HullKey(int hash, int length, int maxVertices) {}
+    private final Map<HullKey, List<float[][]>> hullCache = new HashMap<>();
+
+    /** {@link Hull#enclosing}, cached by the vertex positions, so equal boxes and copies of a model are hulled once. */
+    private float[] enclosingHull(float[] positions, int maxVertices) {
+        HullKey key = new HullKey(Arrays.hashCode(positions), positions.length, maxVertices);
+        List<float[][]> bucket = hullCache.computeIfAbsent(key, k -> new ArrayList<>(1));
+        for (float[][] entry : bucket) if (Arrays.equals(entry[0], positions)) return entry[1];
+        float[] hull = Hull.enclosing(positions, maxVertices);
+        bucket.add(new float[][]{positions.clone(), hull});
+        return hull;
+    }
+
     /**
      * Builds the collision shape: a box if the collider has a size, otherwise the entity's geometry as exact
      * triangles (static physics bodies) or as a hull. Returns null if there is no geometry.
@@ -282,7 +384,7 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                 for (int i = 0; i < m.indices().length; i++) System.arraycopy(m.positions(), m.indices()[i] * 3, tri, i * 3, 3);
                 b = new Body(e.id, c, true, tri);
             } else {
-                b = new Body(e.id, c, false, physics ? Hull.extreme(m.positions(), 64) : Hull.enclosing(m.positions(), c.hullVertices));
+                b = new Body(e.id, c, false, physics ? Hull.extreme(m.positions(), 64) : enclosingHull(m.positions(), c.hullVertices));
             }
         }
         b.upright = e.get(SceneDoc.CameraComponent.class) != null;
@@ -373,12 +475,14 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
 
     /**
      * Advances one frame: constrains script-driven moves of blocking colliders, steps the simulation, writes the
-     * transforms of dynamic bodies back into the scene and updates contacts (see {@link #takeEvents}). Returns all
-     * entities that moved.
+     * transforms of dynamic bodies back into the scene and updates contacts (see {@link #takeEvents}). A simulation
+     * step covers at most 1/20 s, so a long frame (loading, a breakpoint) does not explode the simulation. Only bodies
+     * that moved get a new start for the next move-and-slide. Returns all entities that moved.
      */
     public Set<String> step(float dt, Set<String> scriptMoved) {
         Set<String> out = new LinkedHashSet<>(scriptMoved);
-        for (Body b : bodies.values()) b.moved = false;
+        for (Body b : movedBodies) b.moved = false;
+        movedBodies.clear();
         Set<String> movedClosure = closure(scriptMoved);
         for (String id : scriptMoved) {
             Body b = bodies.get(id);
@@ -393,7 +497,9 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                     matrix(owner, c, c.matrix);
                     c.world = transform(c.local, c.matrix, c.world);
                     aabb(c.world, c.aabb);
+                    grid.update(c);
                     c.moved = true;
+                    movedBodies.add(c);
                     if (system != null && c.jolt >= 0) {
                         Vector3f p = c.matrix.getTranslation(new Vector3f());
                         Quaternionf q = c.matrix.getNormalizedRotation(new Quaternionf());
@@ -407,7 +513,9 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
             matrix(e, b, b.matrix);
             b.world = transform(b.local, b.matrix, b.world);
             aabb(b.world, b.aabb);
+            grid.update(b);
             b.moved = true;
+            movedBodies.add(b);
             if (system != null && b.jolt >= 0) {
                 Vector3f p = b.matrix.getTranslation(new Vector3f());
                 Quaternionf q = b.matrix.getNormalizedRotation(new Quaternionf());
@@ -419,8 +527,7 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                 }
             }
         }
-        if (system != null && dt > 0 && bodies.values().stream().anyMatch(Body::dynamic)) {
-            // a long frame (loading, breakpoint) must not explode the simulation
+        if (system != null && dt > 0 && dynamicCount > 0) {
             float h = Math.min(dt, 1 / 20f);
             system.update(h, Math.max(1, (int) Math.ceil(h * 60)), temp, jobs);
             for (Body b : bodies.values()) {
@@ -440,11 +547,13 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                 b.matrix.set(world);
                 b.world = transform(b.local, b.matrix, b.world);
                 aabb(b.world, b.aabb);
+                grid.update(b);
                 b.moved = true;
+                movedBodies.add(b);
                 out.add(b.id);
             }
         }
-        for (Body b : bodies.values()) {
+        for (Body b : movedBodies) {
             if (b.instance) continue;
             Entity e = doc.find(b.id);
             if (e != null) { b.lastPos = e.position.clone(); b.lastRot = e.rotation.clone(); }
@@ -552,7 +661,7 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
         e.rotation = sr;
         float[] w = transform(b.local, m, null);
         float[] box = aabb(w, new float[6]);
-        for (Body o : bodies.values()) {
+        for (Body o : grid.near(box, 0)) {
             if (o == b || !o.blocking() || family.contains(o.owner)) continue;
             if (!boxesOverlap(box, o.aabb, 0)) continue;
             if (touches(w, box, o, margin)) return true;
@@ -578,16 +687,20 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
 
     /**
      * Detects contacts that began or ended. Only bodies that moved are tested (all non-instanced bodies in the first
-     * frame), so the cost is moved x all rather than all pairs, which keeps scenes with thousands of static copies
-     * cheap.
+     * frame), against the bodies near them and those they touched so far, so the cost is moved x near rather than
+     * all pairs. Events name the owning entities, not their instanced copies.
      */
     private void updateContacts() {
-        List<Body> list = new ArrayList<>(bodies.values());
         Set<Body> done = new HashSet<>();
-        for (Body a : list) {
+        for (Body a : firstContacts ? new ArrayList<>(bodies.values()) : new ArrayList<>(movedBodies)) {
             if (firstContacts ? a.instance : !a.moved) continue;
             done.add(a);
-            for (Body b : list) {
+            List<Body> candidates = grid.near(a.aabb, CONTACT_MARGIN);
+            for (String p : partners.getOrDefault(a.id, Set.of())) {
+                Body pb = bodies.get(p);
+                if (pb != null && pb.stamp != grid.query) candidates.add(pb);
+            }
+            for (Body b : candidates) {
                 if (b == a || done.contains(b)) continue;
                 if (a.mesh && b.mesh) continue;
                 if (a.instance && b.instance) continue;
@@ -600,10 +713,14 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
                 boolean trigger = a.c.trigger || b.c.trigger;
                 if (touching) {
                     pairs.put(key, trigger);
-                    // report the entity, not the copy
+                    partners.computeIfAbsent(a.id, k -> new HashSet<>()).add(b.id);
+                    partners.computeIfAbsent(b.id, k -> new HashSet<>()).add(a.id);
                     events.add(new Event(a.owner, b.owner, trigger, true));
                 } else {
                     pairs.remove(key);
+                    Set<String> pa = partners.get(a.id), pbs = partners.get(b.id);
+                    if (pa != null) pa.remove(b.id);
+                    if (pbs != null) pbs.remove(a.id);
                     events.add(new Event(a.owner, b.owner, was, false));
                 }
             }
@@ -704,10 +821,9 @@ public final class PhysicsWorld implements PhysicsBackend, AutoCloseable {
     /** The given entities plus all of their descendants. */
     private Set<String> closure(Set<String> ids) {
         Set<String> all = new HashSet<>(ids);
-        boolean grew = true;
-        while (grew) {
-            grew = false;
-            for (Entity e : doc.entities) if (e.parent != null && all.contains(e.parent) && all.add(e.id)) grew = true;
+        java.util.ArrayDeque<String> open = new java.util.ArrayDeque<>(ids);
+        while (!open.isEmpty()) {
+            for (String c : children.getOrDefault(open.poll(), List.of())) if (all.add(c)) open.add(c);
         }
         return all;
     }

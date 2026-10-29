@@ -95,6 +95,9 @@ public final class Scene {
 
     /** Starry night sky; the sun acts as the moon. */
     public boolean night;
+    /** Aerial perspective, see {@code SceneDoc.Settings.hazeDensity}. */
+    public float hazeDensity, hazeFalloff = 0.08f, hazeSun = 0.15f;
+    public final Vector3f hazeColor = new Vector3f(0.5f, 0.55f, 0.65f);
     /** HDR panorama used as sky; null selects the procedural sky. */
     public Environment environment;
     public float exposure = 1f;
@@ -104,8 +107,11 @@ public final class Scene {
     public final List<Instance> instances = new ArrayList<>();
     /** Texture sets for virtual texturing. The renderer owns them once it has started. */
     public final List<TextureSet> textureSets = new ArrayList<>();
-    /** Each virtual texture pool holds slotsPerRow^2 tiles. */
-    public int texturePoolSlotsPerRow = 32;
+    /**
+     * Each virtual texture pool holds slotsPerRow^2 tiles; 0 sizes the pools from the VRAM budget
+     * {@code -Dlumvex.texturepool=<MB>} (default 3072 MB), see {@code VirtualTextures.slotsForBudget}.
+     */
+    public int texturePoolSlotsPerRow = 0;
     /** Block-compresses the tile pools: BC7/BC5 for near mips, BC1/BC5 for far mips. */
     public boolean textureCompression = true;
     /** Similarity tolerance for reusing tiles as stand-ins; 0 disables reuse. */

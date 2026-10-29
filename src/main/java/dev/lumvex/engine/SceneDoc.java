@@ -300,8 +300,16 @@ public final class SceneDoc {
         public String textures;
         public float uvScale = 1f;
         public float normalStrength = 1f;
+        /**
+         * Relief depth in meters of the texture set's height map (parallax occlusion mapping with self-shadowing);
+         * 0 keeps the surface flat. Texture sets without a height map stay flat anyway.
+         */
+        public float parallax = 0f;
         /** Marks the visible surface of a light: it glows for the camera but casts no shadow. */
         public boolean lightProxy;
+
+        /** Relief depth of textured materials unless set otherwise: about the depth of a mortar joint. */
+        public static final float DEFAULT_PARALLAX = 0.03f;
 
         /** A material driven entirely by its texture maps (all factors 1). */
         public static MaterialDef textured(String textures, float uvScale) {
@@ -311,6 +319,7 @@ public final class SceneDoc {
             m.metallic = 1f;
             m.textures = textures;
             m.uvScale = uvScale;
+            m.parallax = DEFAULT_PARALLAX;
             return m;
         }
 
@@ -333,8 +342,23 @@ public final class SceneDoc {
         public float environmentStrength = 1f;
         /** Rotates the panorama so its sun sits at this horizontal position (0..1); negative keeps it as captured. */
         public float environmentSunU = -1f;
+        /**
+         * With a panorama: true takes the sun from its brightest spot, false keeps {@link #sunDirection},
+         * {@link #sunColor} and {@link #sunIntensity} (for skies whose sun is hidden or too weak).
+         */
+        public boolean sunFromEnvironment = true;
         /** Starry night sky; the sun then acts as the moon. */
         public boolean night;
+        /**
+         * Aerial perspective: extinction per meter at height 0; 0 disables the haze. The density falls off with
+         * height by {@code exp(-hazeFalloff * y)}.
+         */
+        public float hazeDensity = 0f;
+        public float hazeFalloff = 0.08f;
+        /** Radiance of the haze lit by the sky, in the units of the image before exposure. */
+        public float[] hazeColor = {0.5f, 0.55f, 0.65f};
+        /** Sunlight scattered by the haze towards the camera, relative to the sun's radiance (forward peak). */
+        public float hazeSun = 0.15f;
         public float[] sunDirection = {0.5f, 0.8f, 0.3f};
         public float[] sunColor = {1.0f, 0.95f, 0.85f};
         public float sunIntensity = 3f;
@@ -349,6 +373,17 @@ public final class SceneDoc {
          * history, which keeps the edges stable. The cost grows roughly with twice this percentage.
          */
         public int overscan = 10;
+        /**
+         * How the scene is rendered: {@code "hybrid"} (default; rasterized visibility, path traced light),
+         * {@code "path"} (everything path traced, as before 1.2) or {@code "raster"} (rasterization only, no ray
+         * tracing). GPUs without hardware ray tracing always render {@code "raster"}. See docs/HYBRID_RENDERING.md.
+         */
+        public String renderMode = "hybrid";
+        /**
+         * Strength of the denoiser's disocclusion fix, which fills newly visible pixels in from converged neighbors on
+         * the same surface; 0 disables it, 1 is the default.
+         */
+        public float disocclusionFix = 1f;
     }
 
     /** Shared JSON mapper for scenes, prefabs, materials and project files. Ignores unknown properties. */
@@ -370,10 +405,68 @@ public final class SceneDoc {
         return JSON.convertValue(JSON.valueToTree(this), SceneDoc.class);
     }
 
+    /**
+     * The entity with this id, or null, through an index from id to list position (physics, transforms and scripts
+     * look entities up every frame). Every hit is verified against the list, so edits of the public list never return
+     * a wrong entity, they only cost one rebuild of the index. If the list looks unchanged but the id is missing, an
+     * entity may have replaced another one at the same size, so the list is scanned.
+     */
     public Entity find(String id) {
+        if (id == null || id.isEmpty()) return null;
+        Integer at = index.get(id);
+        if (at != null && at < entities.size()) {
+            Entity e = entities.get(at);
+            if (e.id.equals(id)) return e;
+        }
+        if (entities != indexedList || entities.size() != indexedSize || at != null) {
+            reindex();
+            at = index.get(id);
+            return at == null ? null : entities.get(at);
+        }
         for (Entity e : entities) if (e.id.equals(id)) return e;
         return null;
     }
+
+    @JsonIgnore private final Map<String, Integer> index = new HashMap<>();
+    @JsonIgnore private List<Entity> indexedList;
+    @JsonIgnore private int indexedSize = -1;
+
+    /** Rebuilds the index from id to list position. */
+    private void reindex() {
+        index.clear();
+        for (int i = 0; i < entities.size(); i++) index.put(entities.get(i).id, i);
+        indexedList = entities;
+        indexedSize = entities.size();
+    }
+
+    /**
+     * The entity with its descendants, through an index from parent to children. The index is rebuilt when the list changes or after {@link #childrenChanged}, and every child
+     * is checked against its parent field, so a stale index never moves an entity that left the hierarchy.
+     */
+    public Set<String> withDescendants(Set<String> ids) {
+        if (entities != childrenList || entities.size() != childrenSize) {
+            children.clear();
+            for (Entity e : entities) if (e.parent != null) children.computeIfAbsent(e.parent, k -> new ArrayList<>()).add(e);
+            childrenList = entities;
+            childrenSize = entities.size();
+        }
+        Set<String> all = new HashSet<>(ids);
+        java.util.ArrayDeque<String> open = new java.util.ArrayDeque<>(ids);
+        while (!open.isEmpty()) {
+            String id = open.poll();
+            for (Entity c : children.getOrDefault(id, List.of())) {
+                if (id.equals(c.parent) && all.add(c.id)) open.add(c.id);
+            }
+        }
+        return all;
+    }
+
+    /** Call after entities were reparented without changing the entity list, see {@link #withDescendants}. */
+    public void childrenChanged() { childrenSize = -1; }
+
+    @JsonIgnore private final Map<String, List<Entity>> children = new HashMap<>();
+    @JsonIgnore private List<Entity> childrenList;
+    @JsonIgnore private int childrenSize = -1;
 
     /** World transform of an entity. Cycles in the parent chain are cut off. */
     public Matrix4f worldMatrix(Entity e, Matrix4f dest) {

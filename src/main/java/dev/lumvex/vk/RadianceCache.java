@@ -25,7 +25,7 @@ import static org.lwjgl.vulkan.VK13.*;
  */
 public final class RadianceCache implements AutoCloseable {
     /** Slots of the hash table; must match CACHE_SIZE in cache.glsl. */
-    public static final int SLOTS = 1 << 20;
+    public static final int SLOTS = 1 << 23;
     private static final int BYTES_PER_SLOT = 4 + 4 + 16 + 16;
     private static final int GROUP_SIZE = 256;
 

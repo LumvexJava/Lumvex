@@ -158,8 +158,9 @@ public final class RenderLoop implements Runnable {
     }
 
     /**
-     * Pushes this frame's script changes through physics into the render scene. {@code dt = 0} skips the simulation.
-     * Returns whether anything moved.
+     * Pushes this frame's script changes through physics into the render scene. A structure change rebuilds the
+     * scene softly, so only the changed regions restart, and runs the full physics pass over all colliders.
+     * {@code dt = 0} skips the simulation. Returns whether anything moved.
      */
     private boolean applyRuntime(float dt) {
         SceneDoc d = runtime.doc();
@@ -169,15 +170,16 @@ public final class RenderLoop implements Runnable {
             boolean structure = runtime.takeStructure();
             Set<String> moved = runtime.takeMoved();
             if (structure) {
+                d.childrenChanged();
                 rebuilds++;
-                // soft build: only changed regions restart
                 builder.build(d, true);
                 animated = builder.lastChanged() > 0;
                 updateStats();
             }
             if (physics != null) {
                 long t0 = System.nanoTime();
-                physics.sync(d);
+                if (structure || !physicsSynced) physics.sync(d);
+                physicsSynced = true;
                 physics.teleported(runtime.takeTeleported());
                 moved = physics.step(dt, moved);
                 for (PhysicsWorld.Event ev : physics.takeEvents()) runtime.collision(ev.a(), ev.b(), ev.trigger(), ev.enter());
@@ -192,6 +194,7 @@ public final class RenderLoop implements Runnable {
     }
 
     private int uiW, uiH;
+    private boolean physicsSynced;
 
     /** Re-renders the game UI when the scripts changed it or the output size changed. */
     private void updateUi() {
@@ -326,12 +329,15 @@ public final class RenderLoop implements Runnable {
         return moved;
     }
 
+    /** Passes the scene's render settings to the renderer; {@code -Dlumvex.overscan} wins over the scene's overscan. */
     private void applySettings(SceneDoc doc) {
         renderer.maxBounces = doc.settings.bounces;
         renderer.sampleLimit = doc.settings.sampleLimit;
         renderer.exposure = doc.settings.exposure;
         renderer.flareStrength = doc.settings.lensFlares;
         renderer.setOverscan(Integer.getInteger("lumvex.overscan", doc.settings.overscan) / 100f);
+        renderer.setRenderMode(Renderer.RenderMode.parse(doc.settings.renderMode));
+        renderer.setDisocclusionFix(doc.settings.disocclusionFix);
     }
 
     // Triangles are reported twice: stored (each mesh once) and rendered (summed over instances).

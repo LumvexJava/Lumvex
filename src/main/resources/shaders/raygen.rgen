@@ -1,6 +1,7 @@
 #version 460
 #include "common.glsl"
 #include "vt.glsl"
+#include "surface.glsl"
 #ifdef LUMVEX_CACHE
 #extension GL_EXT_shader_atomic_float : require
 #endif
@@ -75,7 +76,8 @@ layout(set = 0, binding = 22, std430) buffer RayStats { uint stats[]; };
 const uint STAT_WARP_RATE = 16u;
 bool gStatWarp = false;
 const uint STAT_SAMPLES = 0u, STAT_RAYS = 1u, STAT_SHADOW = 2u, STAT_CACHE_STOP = 3u, STAT_TRAIN = 4u, STAT_CENTER = 5u,
-           STAT_SPEC = 6u, STAT_PIXELS = 7u, STAT_RESTIR = 8u, STAT_IND_SKIP = 9u, STAT_SEGMENTS = 10u, STAT_HIST = 16u;
+           STAT_SPEC = 6u, STAT_PIXELS = 7u, STAT_RESTIR = 8u, STAT_IND_SKIP = 9u, STAT_SEGMENTS = 10u, STAT_RASTER = 11u,
+           STAT_HIST = 16u;
 
 // Moving objects: swept boxes and influence radii.
 const uint  MAX_DYNAMIC = 64u;
@@ -143,14 +145,17 @@ const float GLOSSY_MIS_ROUGHNESS = 0.02;
 const float SUN_MIRROR_ROUGHNESS = 0.08;
 
 // Shadow ray against opaque geometry; cutouts are resolved by the any-hit shader.
-bool traceShadow(vec3 origin, vec3 dir, float tMax) {
+bool traceShadowMask(vec3 origin, vec3 dir, float tMax, uint mask) {
     gPathStats += 256u;
     shadowed = true;
     traceRayEXT(tlas,
                 gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
-                0x01 /* opaque only */, 0, 1, 1 /* shadow miss */, origin, 0.0, dir, tMax, 1);
+                mask, 0, 1, 1 /* shadow miss */, origin, 0.0, dir, tMax, 1);
     return shadowed;
 }
+
+// Opaque and alpha-tested surfaces (instance masks 0x01 and 0x10, see Renderer.writeTlasInstances); not glass.
+bool traceShadow(vec3 origin, vec3 dir, float tMax) { return traceShadowMask(origin, dir, tMax, 0x11u); }
 
 // Light found by BSDF sampling after the first bounce is clamped. Small, very bright emitters would otherwise
 // produce fireflies that take thousands of samples to converge. This is a small, deliberate bias.
@@ -205,6 +210,9 @@ layout(set = 0, binding = 20, std430) readonly buffer Lights { uvec4 lightHeader
 // lightHeader2: x guard band (field of view scale of the training pass), yz its predicted shift in NDC,
 // w catch-up samples for newly visible pixels.
 const uint OPT_LIGHT_IMPORTANCE = 1u, OPT_CACHE_PATHS = 2u, OPT_RESTIR = 4u, OPT_SER = 8u, OPT_STATS = 16u, OPT_LIGHT_GRID = 32u, OPT_PRIOR = 64u;
+// OPT_RASTER: the primary surface comes from the raster pre-pass. OPT_CUTOUTS: the scene has alpha-tested instances,
+// which the raster pass leaves out (see primaryHit).
+const uint OPT_RASTER = 128u, OPT_CUTOUTS = 256u;
 bool opt(uint bit) { return (lightHeader.y & bit) != 0u; }
 
 // Selects every STAT_WARP_RATE-th subgroup, varying per frame, to record statistics.
@@ -247,20 +255,21 @@ void flushPathStats(uint kind) {
     }
 }
 
-// Traces a ray into `payload`. With `reorder`, shader execution reordering regroups threads by what they hit,
-// so the shading of incoherent bounce rays runs coherently.
+// Traces a ray into `payload`; opacity comes from the instance flags. With `reorder`, shader execution reordering
+// regroups threads by what they hit, so the shading of incoherent bounce rays runs coherently.
 void traceClosest(vec3 ro, vec3 rd, bool reorder) {
     gPathStats += 1u;
+    float tMax = 1e4;
 #ifdef LUMVEX_SER
     if (reorder && opt(OPT_SER)) {
         hitObjectEXT hit;
-        hitObjectTraceRayEXT(hit, tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, ro, 0.0, rd, 1e4, 0);
+        hitObjectTraceRayEXT(hit, tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, ro, 0.0, rd, tMax, 0);
         reorderThreadEXT(hit, hitObjectIsHitEXT(hit) ? (uint(hitObjectGetInstanceIdEXT(hit)) & 127u) + 1u : 0u, 8u);
         hitObjectExecuteShaderEXT(hit, 0);
         return;
     }
 #endif
-    traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, ro, 0.0, rd, 1e4, 0);   // opacity comes from the instance flags
+    traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, ro, 0.0, rd, tMax, 0);
 }
 
 float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
@@ -513,16 +522,104 @@ vec3 specularShare(vec3 added, vec3 fSpec, vec3 f) {
 const uint MATERIAL_LIGHT_PROXY = 1u;  // visible shape of a sphere light: not counted twice, casts no shadow
 
 // Textures, see vt.glsl.
-float gTexMipWanted = -1.0, gTexMipUsed = -1.0, gTexStandIn = 0.0; // of the last textured hit, for debug view 6
+float gTexMipWanted = -1.0, gTexMipUsed = -1.0, gTexStandIn = 0.0;
 
-// Applies the texture set at the current hit. coneWidth is the ray cone footprint used for the LOD; with
-// `request` the needed tile is reported to the feedback buffer.
+// Parallax occlusion mapping
+//
+// Normal maps change the shading but not what is seen: mortar joints and the gaps between cobbles stay flat, most
+// of all at grazing angles. Where a texture set has a height map and the material a relief depth, the view ray is
+// marched through the height field in texture space (Tatarchuk 2006) and the texture is read where it meets the
+// relief. The same height field then shadows the light arriving at that point (pomShadow), so bricks cast small
+// shadows into their joints under a low sun. Only rays that sample the finest tiles do this: camera rays and
+// reflections close to the camera.
+const float POM_MAX_LOD = 4.0;
+
+bool  gPom = false;
+
+uint  gPomSet, gPomMip;
+vec2  gPomUv;
+
+float gPomDepth;
+
+vec2  gPomScale;
+
+vec3  gPomT, gPomB, gPomN;
+
+// Height at texture coordinates for the current relief, or -1 when the fine tile is not resident.
+float pomHeight(vec2 uv) { return vtHeight(gPomSet, uv, gPomMip); }
+
+// Marches the view ray through the height field and returns where it meets the relief; sets the gPom state. The
+// texture offset per meter comes from the base LOD the closest-hit shader computed; 8 to 20 steps from the top of the
+// relief down (more at grazing angles), with a linear refinement between the last step above and the first below.
+vec2 parallaxUv(uint set, vec2 uv, float lod, Material m, vec3 N, vec3 rd) {
+    gPom = false;
+    if (m.parallax <= 0.0 || lod > POM_MAX_LOD) return uv;
+    vec3 T = payload.tangent, B = payload.tangentSign * cross(N, T);
+    vec3 V = -rd;
+    vec3 v = vec3(dot(V, T), dot(V, B), dot(V, N));
+    if (v.z < 0.08) return uv;
+    float perMeter = exp2(payload.texelDensity) * m.uvScale;
+    gPomSet = set;
+    gPomMip = uint(max(lod, 0.0));
+    gPomScale = vec2(perMeter * m.parallax);
+    gPomT = T; gPomB = B; gPomN = N;
+    vec2 shift = v.xy / v.z * gPomScale;
+    float h0 = pomHeight(uv);
+    if (h0 < 0.0) return uv;
+    int steps = int(mix(8.0, 20.0, 1.0 - v.z));
+    float layer = 1.0 / float(steps);
+    float d = 0.0, prevD = 0.0, prevGap = 1.0 - h0;
+    vec2 p = uv;
+    for (int i = 0; i < steps; ++i) {
+        float h = pomHeight(p);
+        float gap = (1.0 - h) - d;
+        if (gap <= 0.0) {
+            float f = prevGap / max(prevGap - gap, 1e-5);
+            d = mix(prevD, d, f);
+            p = uv - shift * d;
+            break;
+        }
+        prevD = d;
+        prevGap = gap;
+        d += layer;
+        p = uv - shift * d;
+    }
+    gPom = true;
+    gPomUv = p;
+    gPomDepth = min(d, 1.0);
+    return p;
+}
+
+// Share of light from direction L that the relief lets through at the last relief-mapped hit: a few steps from the
+// hit point up towards the light; heights above the ray darken it, softly by how far they reach above.
+float pomShadow(vec3 L) {
+    if (!gPom) return 1.0;
+    vec3 l = vec3(dot(L, gPomT), dot(L, gPomB), dot(L, gPomN));
+    if (l.z <= 0.02) return 1.0;
+    vec2 shift = l.xy / l.z * gPomScale;
+    float blocked = 0.0;
+    const int STEPS = 8;
+    for (int i = 1; i <= STEPS; ++i) {
+        float d = gPomDepth * (1.0 - float(i) / float(STEPS));
+        float h = pomHeight(gPomUv + shift * (gPomDepth - d));
+        if (h < 0.0) return 1.0;
+        blocked = max(blocked, h - (1.0 - d));
+    }
+    return 1.0 - smoothstep(0.0, 0.08, blocked);
+} // of the last textured hit, for debug view 6
+
+// Applies the texture set at the current hit: albedo (times the AO map, occlusion detail the geometry does not have),
+// roughness, metallic and the normal map; relief where `request` is set. coneWidth is the ray cone footprint used for
+// the LOD; with `request` the needed tile is reported to the feedback buffer.
 void applyTextures(inout Material m, inout vec3 N, vec3 rd, float coneWidth, float distance, bool request, inout uint seed) {
+    gPom = false;
     if (m.textureSet < 0) return;
     uint set = uint(m.textureSet);
     float lod = vtLod(set, payload.texelDensity, m.uvScale, coneWidth, abs(dot(N, rd)));
-    VtSample t = vtSample(set, payload.uv * m.uvScale, lod, distance, seed, request);
-    m.albedo *= t.albedo.rgb * t.orm.x;     // AO: occlusion detail the geometry does not have
+    vec2 uv = payload.uv * m.uvScale;
+    if (request) uv = parallaxUv(set, uv, lod, m, N, rd);
+    VtSample t = vtSample(set, uv, lod, distance, seed, request);
+    m.albedo *= t.albedo.rgb * t.orm.x;
     m.roughness *= t.orm.y;
     m.metallic *= t.orm.z;
     if (m.normalStrength > 0.0) {
@@ -598,38 +695,57 @@ int indirectSlot(vec3 P, vec3 N, bool insert) {
 float cacheCellSize() { return 0.005 * exp2(float(INDIRECT_LEVEL)); }
 #endif
 
+// Traces one path from ro along rd and returns its radiance; fills the guides in g at the first non-mirror vertex.
 // firstSpecular is false when the caller already sampled the sun for this ray's origin. coneSpread is the ray cone
-// spread angle used for texture LODs.
+// spread angle used for texture LODs; only camera rays and their sharp reflections request texture tiles.
+//
+// Per vertex:
+// - Path regularization: after a diffuse bounce glossy surfaces count as somewhat rough. Diffuse-glossy-light paths
+//   to small bright emitters are rare but hundreds of times brighter than their pixel and showed as speckles.
+// - Shading normals that face away from the viewer at silhouettes are bent back towards it, since N.V near 0 makes
+//   the specular BRDF explode.
+// - Guides: the denoiser divides the diffuse light by g.albedo. Where the specular share stays in the diffuse light
+//   (rough surfaces), the white specular albedo is included, which keeps saturated colors from amplifying the noise
+//   of their highlights. Below SPECULAR_SPLIT_ROUGHNESS the specular share is kept apart: everything that leaves the
+//   guide surface through its specular lobe after it was chosen (specFrom).
+// - Emission; a light proxy only counts where its light is not sampled explicitly (for the camera and in mirrors),
+//   weighed by MIS against the last glossy reflection ray.
+// - Radiance cache: after a diffuse bounce (glass and mirrors do not count, or surfaces seen through them would show
+//   the 8 cm cells) and a long enough segment (a short one, in a corner, would read the cell next to where the path
+//   came from), the path ends in a trained cell. The training pass records bounces 1 to TRAIN_VERTS instead; cells
+//   near moving objects keep a short history. At the end the light gathered after each recorded vertex, divided by
+//   the throughput and albedo there, is that vertex's outgoing radiance.
+// - Glass: Fresnel-weighted reflection or refraction.
+// - Opaque: lobe probabilities in proportion to what each lobe reflects (by the Fresnel term alone, the specular lobe
+//   of a dark polished floor was chosen rarely and weighted highly, which showed reflected lamps as fireflies). NEE
+//   towards the sun's cone and a sphere light; at the visible surface ReSTIR has already picked the light sample.
+//   Points seen in a sharp reflection get the full weighted light choice, since the cheap one made the reflection of
+//   a block lit by a tiny lamp a field of noise. Indirect light may be spread over frames (gIndirectMode). Glossy
+//   lobes widen the ray cone; after a diffuse bounce only coarse mips matter.
+// - Russian roulette from bounce 3.
 vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpecular, uint maxBounces, float coneSpread) {
     float coneWidth = 0.0;
-    bool texRequest = firstSpecular; // only camera rays and their mirror reflections request tiles
+    bool texRequest = firstSpecular;
     vec3 radiance = vec3(0.0);
     vec3 throughput = vec3(1.0);
     bool specularBounce = firstSpecular;
-    bool sunByReflection = firstSpecular;   // whether a ray that hits the sun disk adds it, see SUN_MIRROR_ROUGHNESS
+    bool sunByReflection = firstSpecular;
     vec3 sunDir = normalize(pc.sunDirection);
     float pathLength = 0.0;
-    // Diffuse or rough bounces blur what follows; only after one may a path end in the cache. Glass and mirrors do
-    // not count, otherwise surfaces seen through them would show the cache's 8 cm cells.
     uint diffuseBounces = 0u;
 #if defined(LUMVEX_CACHE) && defined(LUMVEX_TRAIN_PASS)
-    // Training data per bounce: cache slot, radiance before the vertex, 1 / (throughput * albedo).
     int  trainSlot[TRAIN_VERTS];
     vec3 trainBefore[TRAIN_VERTS];
     vec3 trainScale[TRAIN_VERTS];
     uint trainCount = 0u;
 #endif
-
-    // The specular share: everything that leaves the guide surface through its specular lobe. specFrom is the
-    // radiance when the lobe was chosen; what the path gathers after that is specular.
     bool specOpen = false, specRay = false;
     vec3 specFrom = vec3(0.0);
-    // MIS of the last glossy reflection ray: its pdf and where it started, for weighing a light it hits.
     float misPdf = 0.0;
     vec3 misOrigin = vec3(0.0), misNormal = vec3(0.0);
     bool misCheap = false;
     for (uint bounce = 0; bounce < maxBounces; ++bounce) {
-        traceClosest(ro, rd, bounce > 0u);   // only bounce rays are incoherent enough to reorder
+        traceClosest(ro, rd, bounce > 0u);
         if (bounce == 0u) g.firstInstance = payload.hitT < 0.0 ? 0u : payload.instanceIndex + 1u;
         if (specRay) { g.specHit = payload.hitT < 0.0 ? SPECULAR_SKY_DISTANCE : payload.hitT; specRay = false; }
 
@@ -651,30 +767,21 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
         }
         vec3 N = payload.normal;
         applyTextures(m, N, rd, coneWidth, pathLength, texRequest, seed);
-        // Path regularization. Diffuse-glossy-light paths to small bright emitters are rare but hundreds of times
-        // brighter than their pixel, and show up as speckles for hundreds of samples. Treating glossy surfaces as
-        // somewhat rough after a diffuse bounce trades that for slightly blurred indirect highlights.
         if (diffuseBounces > 0u && m.transmission < 0.5) m.roughness = max(m.roughness, REGULARIZE_ROUGHNESS);
         vec3 Ng = payload.geoNormal;
         bool frontFace = dot(rd, Ng) < 0.0;
         if (!frontFace) { N = -N; Ng = -Ng; }
         vec3 V = -rd;
-        // Shading normals can face away from the viewer at silhouettes, where N.V near 0 makes the specular BRDF
-        // explode. Bend N back towards V.
         float nv = dot(N, V);
         if (nv < 0.05) N = normalize(N + V * (0.05 - nv));
 
         bool mirrorLike = m.transmission > 0.5 || (m.metallic > 0.5 && m.roughness < 0.1);
-        // guideHere: this vertex sets the guides and its specular lobe is kept apart (glossy surfaces only).
         bool guideHere = false;
         if (!g.done && (!mirrorLike || bounce + 1u == maxBounces)) {
             g.normal = N;
             g.distance = pathLength;
             float roughness = m.transmission > 0.5 ? 0.0 : m.roughness;
             guideHere = roughness < SPECULAR_SPLIT_ROUGHNESS;
-            // The denoiser divides the diffuse light by this and multiplies it back afterwards. Where the specular
-            // share stays in it (rough surfaces), the white specular albedo is included, which keeps saturated
-            // colors (a red ball: green and blue near 0) from amplifying the noise of their highlights.
             vec3 F0 = mix(vec3(0.04), m.albedo, m.metallic);
             vec3 specAlbedo = m.transmission > 0.5 ? vec3(1.0) : specularAlbedo(F0, roughness, max(dot(N, -rd), 1e-4));
             g.albedo = dot(m.emission, m.emission) > 0.0 ? normalize(m.emission)
@@ -688,7 +795,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
         if (pc.debugMode == 1u) return N * 0.5 + 0.5;
         if (pc.debugMode == 2u) return m.albedo + m.emission;
 
-        // A light proxy only counts where its light is not sampled explicitly: for the camera and in mirrors.
         bool proxy = (m.flags & MATERIAL_LIGHT_PROXY) != 0u;
         if (!proxy || bounce == 0u || specularBounce) {
             float w = 1.0;
@@ -701,11 +807,8 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
         misPdf = 0.0;
 
 #ifdef LUMVEX_CACHE
-        // Radiance cache: end the path here, or record the vertex for training.
         if (bounce >= 1u && !proxy && cacheable(m)) {
             vec3 albedo = m.albedo * (1.0 - m.metallic);
-            // A short segment (a corner) would read the cell next to where the path came from, which shows the
-            // cell grid; such paths take one more bounce.
             if (gTerminate && diffuseBounces >= (lightHeader.w & 255u)
                     && payload.hitT > TERMINATE_SEGMENT * cacheCellSize()) {
                 int slot = indirectSlot(P, N, false);
@@ -724,7 +827,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
                 if (luminance(ta) > 1e-3) {
                     int slot = indirectSlot(P, N, true);
                     if (slot >= 0) {
-                        // Light near moving objects changes; the resolve pass keeps a short history there.
                         if (nearDynamic(P)) atomicOr(cacheMeta[slot], CACHE_DYNAMIC);
                         trainSlot[trainCount] = slot;
                         trainBefore[trainCount] = radiance;
@@ -738,7 +840,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
 #endif
 
         if (m.transmission > 0.5) {
-            // Smooth dielectric
             float eta = frontFace ? 1.0 / m.ior : m.ior;
             float cosI = clamp(dot(V, N), 0.0, 1.0);
             float F = fresnelDielectric(cosI, eta);
@@ -756,34 +857,26 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
             sunByReflection = true;
             if (guideHere) { specOpen = true; specRay = true; specFrom = radiance; }
         } else {
-            // Metallic-roughness
             float alpha = max(m.roughness * m.roughness, 1e-3);
             vec3 F0 = mix(vec3(0.04), m.albedo, m.metallic);
             vec3 diffuseColor = m.albedo * (1.0 - m.metallic);
             float NdotV = max(dot(N, V), 1e-4);
             vec3 Fv = fresnelSchlick(F0, NdotV);
             ro = P + Ng * EPS;
-
-            // Lobe probabilities, in proportion to what each lobe reflects. Choosing by the Fresnel term alone
-            // picked the specular lobe of a dark polished floor in 5 % of the paths and weighted it 20 times: a
-            // reflected bulb or neon tube showed as scattered fireflies.
             float specWeight = luminance(Fv);
             float diffuseWeight = luminance(diffuseColor * (1.0 - Fv));
             float specProb = clamp(specWeight / max(specWeight + diffuseWeight, 1e-4), MIN_LOBE_PROBABILITY,
                                    diffuseWeight > 0.0 ? 1.0 - MIN_LOBE_PROBABILITY : 1.0);
             bool glossy = m.roughness >= GLOSSY_MIS_ROUGHNESS && m.roughness < SPECULAR_NEE_ROUGHNESS;
-
-            // NEE towards the sun, sampling its cone for soft shadows.
             bool sunMirror = m.metallic > 0.5 && m.roughness < SUN_MIRROR_ROUGHNESS;
             vec3 L = sampleCone(sunDir, SUN_COS_ANGLE, seed);
             float NdotL = dot(N, L);
             if (!sunMirror && pc.sunIntensity > 0.0 && NdotL > 0.0 && dot(Ng, L) > 0.0 && !traceShadow(ro, L, 1e4)) {
                 vec3 f = evalBrdf(N, V, L, diffuseColor, F0, Fv, alpha, m.roughness, NdotV);
-                vec3 added = throughput * f * pc.sunColor * pc.sunIntensity * NdotL;
+                vec3 added = throughput * f * pc.sunColor * pc.sunIntensity * NdotL * pomShadow(L);
                 radiance += added;
                 if (guideHere) g.specular += specularShare(added, evalSpecular(N, V, L, F0, alpha, m.roughness, NdotV), f);
             }
-            // NEE towards a sphere light. At the visible surface ReSTIR has already picked the sample.
             if (bounce == 0u && gResPacked != 0u && (gResPacked & 0xFFFFFFu) == payload.instanceIndex + 1u) {
                 uint rk = gResPacked >> 24u;
                 vec3 rn = decodeNormal(gResDir);
@@ -795,7 +888,7 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
                 float NdotLl = dot(N, Ll);
                 if (gResW > 0.0 && cosY > 0.0 && NdotLl > 0.0 && dot(Ng, Ll) > 0.0 && !traceShadow(ro, Ll, d * 0.999)) {
                     vec3 f = evalBrdf(N, V, Ll, diffuseColor, F0, Fv, alpha, m.roughness, NdotV);
-                    vec3 added = throughput * f * lights[rk].radiance.rgb * (NdotLl * cosY / d2 * gResW);
+                    vec3 added = throughput * f * lights[rk].radiance.rgb * (NdotLl * cosY / d2 * gResW) * pomShadow(Ll);
                     radiance += added;
                     if (guideHere) g.specular += specularShare(added, evalSpecular(N, V, Ll, F0, alpha, m.roughness, NdotV), f);
                 }
@@ -803,9 +896,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
                 vec3 Ll;
                 float lightT, lightPdfW;
                 uint lk;
-                // Points seen in a sharp reflection are as visible as those the camera sees directly and get the
-                // full weighted light choice; the cheap one, for indirect light, made the reflection of a block lit
-                // by a tiny lamp a field of noise.
                 gCheapLight = bounce > 0u && !specularBounce;
                 if (sampleLightDir(ro, N, seed, lk, Ll, lightT, lightPdfW)) {
                     float NdotLl = dot(N, Ll);
@@ -814,20 +904,18 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
                                            * glossyLightWeight(lk, lightPdfW, N, V, Ll, alpha, specProb)
                                          : evalSpecular(N, V, Ll, F0, alpha, m.roughness, NdotV);
                         vec3 f = diffuseColor / PI * (1.0 - Fv) + fs;
-                        vec3 added = clampIndirect(throughput * f * lights[lk].radiance.rgb / lightPdfW * NdotLl, bounce);
+                        vec3 added = clampIndirect(throughput * f * lights[lk].radiance.rgb / lightPdfW * NdotLl * pomShadow(Ll), bounce);
                         radiance += added;
                         if (guideHere) g.specular += specularShare(added, fs, f);
                     }
                 }
             }
 
-            // Indirect light spread over frames: only some pixels continue, weighted to keep the mean.
             if (bounce == 0u && gIndirectMode != 0.0 && !mirrorLike) {
                 if (gIndirectMode < 0.0) { gPathStats |= 1u << 17u; break; }
                 throughput *= gIndirectMode;
             }
 
-            // Choose a lobe for the continuation ray.
             if (rnd(seed) < specProb) {
                 vec3 H = sampleGGX(N, alpha, seed);
                 vec3 newDir = reflect(rd, H);
@@ -849,11 +937,11 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
                 specularBounce = m.roughness < SPECULAR_NEE_ROUGHNESS;
                 sunByReflection = sunMirror;
                 if (!specularBounce) diffuseBounces++;
-                coneSpread += m.roughness * m.roughness;          // glossy lobes widen the cone
+                coneSpread += m.roughness * m.roughness;
                 texRequest = texRequest && m.roughness < 0.1;
             } else {
                 rd = cosineSampleHemisphere(N, seed);
-                coneSpread = max(coneSpread, 0.3);                 // only coarse mips matter after a diffuse bounce
+                coneSpread = max(coneSpread, 0.3);
                 texRequest = false;
                 throughput *= diffuseColor * (1.0 - Fv) / (1.0 - specProb);
                 specularBounce = false;
@@ -862,7 +950,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
             }
         }
 
-        // Russian roulette
         if (bounce >= 3u) {
             float p = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.05, 0.95);
             if (rnd(seed) > p) break;
@@ -871,7 +958,6 @@ vec3 pathTrace(vec3 ro, vec3 rd, inout uint seed, inout GBuffer g, bool firstSpe
     }
     if (specOpen) g.specular += radiance - specFrom;
 #if defined(LUMVEX_CACHE) && defined(LUMVEX_TRAIN_PASS)
-    // Training: the light gathered after a vertex is that vertex's outgoing radiance.
     for (uint i = 0u; i < trainCount; ++i) {
         vec3 v = (radiance - trainBefore[i]) * trainScale[i];
         if (any(isnan(v)) || any(isinf(v))) continue;
@@ -1058,6 +1144,11 @@ void capHistory(inout History h, float cap) {
     h.count = min(h.count, cap);
 }
 
+// Weight of this frame's albedo in the albedo guide while the camera moves, see step 5 of main.
+const float MOVING_ALBEDO_WEIGHT = 0.5;
+// The albedo the denoiser divides by and the composite multiplies back in; must match demodAlbedo in atrous.comp.
+vec3 demodulationAlbedo(vec3 a) { return luminance(a) < 1e-3 ? vec3(1.0) : max(a, vec3(0.02)); }
+
 // History length while the camera moves. View-dependent surfaces (mirrors, glass, glossy metal) change with every
 // move and need shorter histories, see movingHistoryCap().
 const float MOVING_HISTORY = 32.0;
@@ -1188,6 +1279,79 @@ void main() {
     flushPathStats(PATH_OTHER);
 }
 #else
+// Hybrid rendering: primary visibility by rasterization
+//
+// The raster pre-pass (RasterPrepass.java, raster.vert/.frag) draws the scene into a visibility buffer that holds
+// (instance + 1, the triangle's three vertex indices) of the nearest surface at every pixel center, 0 for sky. Here
+// the hit is rebuilt from it
+// with one ray-triangle intersection instead of a ray traversal, and the payload is filled by the same code as the
+// closest-hit shader (surface.glsl). Rays only take over for what rasterization cannot answer: alpha-tested cutouts,
+// which the raster pass leaves out, and grazing triangles whose intersection is numerically unreliable.
+layout(set = 0, binding = 30, rgba32ui) uniform readonly uimage2D visibility;
+layout(set = 0, binding = 31, scalar) readonly buffer InstanceTransforms { mat4x3 objectToWorld[]; };
+// Instance mask of cutout instances, set in addition to their regular mask (Renderer.writeTlasInstances).
+const uint CUTOUT_MASK = 0x08u;
+
+// Rebuilds the payload of the triangle with the vertices `v` of render instance `index` hit by the ray ro + t rd.
+// Returns false when the ray does not meet the triangle's plane in front of the camera. Moeller-Trumbore, with the
+// barycentrics clamped instead of rejected: at triangle edges the rasterizer's coverage rule and the ray may
+// disagree by a hair, and the nearest point of the rasterized triangle is right.
+bool rasterPrimary(uint index, uvec3 v, vec3 ro, vec3 rd) {
+    InstanceInfo inst = instances[index];
+    Triangle tri = fetchTriangleVertices(inst, v);
+    mat4x3 o2w = objectToWorld[index];
+    vec3 a = o2w * vec4(tri.p0, 1.0), b = o2w * vec4(tri.p1, 1.0), c = o2w * vec4(tri.p2, 1.0);
+    vec3 e1 = b - a, e2 = c - a;
+    vec3 pv = cross(rd, e2);
+    float det = dot(e1, pv);
+    if (abs(det) < 1e-10 * dot(e1, e1) * dot(e2, e2) + 1e-20) return false;
+    float inv = 1.0 / det;
+    vec3 tv = ro - a;
+    vec3 qv = cross(tv, e1);
+    float t = dot(e2, qv) * inv;
+    if (!(t > 0.0)) return false;
+    vec2 uv = clamp(vec2(dot(tv, pv), dot(rd, qv)) * inv, 0.0, 1.0);
+    if (uv.x + uv.y > 1.0) uv /= uv.x + uv.y;
+    mat3 toWorld = mat3(o2w);
+    payload = surfaceHit(tri, uv, toWorld, transpose(inverse(toWorld)), inst.materialIndex, index, ro + rd * t, t);
+    return true;
+}
+
+// The surface seen through the pixel center, in `payload` (hitT < 0 for sky): from the visibility buffer where
+// enabled, otherwise by tracing. With cutouts in the scene, one ray against only the cutout instances, up to the
+// rasterized surface, finds a cutout in front of it.
+void primaryHit(ivec2 pixel, vec3 ro, vec3 rd) {
+    if (opt(OPT_RASTER)) {
+        uvec4 vis = imageLoad(visibility, pixel);
+        bool ok = true;
+        if (vis.x == 0u) payload.hitT = -1.0;
+        else ok = rasterPrimary(vis.x - 1u, vis.yzw, ro, rd);
+        if (ok) {
+            flushStat(STAT_RASTER, 1u);
+            if (opt(OPT_CUTOUTS)) {
+                HitPayload raster = payload;
+                traceRayEXT(tlas, gl_RayFlagsNoneEXT, CUTOUT_MASK, 0, 1, 0, ro, 0.0, rd, raster.hitT >= 0.0 ? raster.hitT : 1e4, 0);
+                flushStat(STAT_CENTER, 1u);
+                if (payload.hitT < 0.0) payload = raster;
+            }
+            return;
+        }
+    }
+    traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, ro, 0.0, rd, 1e4, 0);
+    flushStat(STAT_CENTER, 1u);
+}
+
+// Whether the pixel lies on a silhouette in this frame: a neighbor in the visibility buffer shows another instance.
+bool rasterSilhouette(ivec2 pixel, uint instance) {
+    ivec2 size = imageSize(visibility);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            ivec2 q = clamp(pixel + ivec2(dx, dy), ivec2(0), size - 1);
+            if (imageLoad(visibility, q).x != instance) return true;
+        }
+    }
+    return false;
+}
 // ReSTIR DI for sphere lights at the visible surface. Cheap candidates, the previous frame's choice and two
 // neighbors' choices are resampled by their unshadowed contribution, and only the winner gets a shadow ray.
 // Samples are points on the light spheres (area measure), so other pixels can reuse them.
@@ -1236,6 +1400,43 @@ void resMerge(inout Reservoir r, vec4 stored, vec3 x, vec3 N, vec3 V, Material m
 }
 
 // Image pass: reproject the history, trace this frame's samples, blend them in and write the outputs.
+//
+// 1. The visible surface through the pixel center (primaryHit). Debug view 8 instead compares the visibility buffer
+//    with a traced ray: instance colors, red where they disagree. The visible surface's texture tiles, both mips the
+//    stochastic LOD can round to, are requested every frame, even for converged pixels, so on-screen tiles are never
+//    evicted. Primary surface replacement: behind flat glass the history follows the surface seen through it (a
+//    camera ray passes a pane almost straight); curved glass bends the view and keeps the glass surface.
+// 2. The history, reprojected with object motion, capped while the camera moves (shorter behind glass and on view-
+//    dependent surfaces). At a silhouette in motion part of it belongs to another object: a pixel that is no longer
+//    on a silhouette in the visibility buffer drops it and catches up like a newly visible one, which removes the
+//    dotted trails of former edges (depth of field spreads samples over many pixels and only caps it). The motion
+//    image's w is the least weight the temporal filter gives this frame: 1 for glass and mirrors, whose content moves
+//    differently from the surface, more than 0 where a moving object changes the light, 0 elsewhere. Glossy metals
+//    and silhouettes keep their temporal history, otherwise they would show raw noise in motion. Near moving objects
+//    the history is shortened by their influence (a moving object skips its own zone, which would count as a moving
+//    shadow on every lit point of it), and silhouettes of moving objects keep only the minimum. Debug views 6 (texture
+//    mips: color the mip used, cyan stand-ins, red stripes a coarser fallback) and 5 (influence zones: blue kept,
+//    orange restarted) end here.
+// 3. Converged pixels keep their history.
+// 4. New samples. ReSTIR picks the visible surface's light sample from cheap candidates and the previous frame's
+//    choice (spatial reuse without MIS weights is biased, so LUMVEX_RESTIR_SPATIAL is opt-in); an occluded choice is
+//    dropped, which keeps shadows sharp. Newly visible pixels take the catch-up samples, moving objects more samples
+//    per frame, since their history stays short. Indirect light may be spread over 1 / period of the samples,
+//    rotating over pixels and frames. Per sample: the path, with debug view 7 (path length: blue one ray, red the
+//    maximum, magenta ended in the cache). Behind glass the guides come from the surface after the pane; samples the
+//    pane reflected are left out of them. While animating, a background sample that hit a moving object is skipped,
+//    since it would leave a trail. Extreme values are clamped, and from FIREFLY_MIN_HISTORY on a sample far brighter
+//    than the history (a rare path to a small bright light) is cut back: the diffuse share by the history's mean and
+//    spread, the specular share by a multiple of its mean. The diffuse and specular shares are kept apart; the
+//    diffuse second moment feeds the denoiser's variance.
+// 5. The samples are blended into the history as a running mean. At a silhouette in motion a history far brighter
+//    than this frame's samples (the lamp bulb beside it) is dropped, or it would trail behind as a row of arcs.
+//    Textures stay sharp in motion: the reprojected radiance is divided by its albedo and multiplied by one that is
+//    mostly this frame's, since every resampling of the history softens the texture while the light survives it. The
+//    specular share follows its reflection's virtual point where the reflection is sharp (exact for flat reflectors,
+//    so with a bounded history), else moves with the surface with a short history. With OPT_PRIOR a newly visible
+//    surface blends in the albedo times the cached light with the weight of PRIOR_SAMPLES samples (not near moving
+//    objects, where the cache still holds the old light); real samples dilute it.
 void main() {
     chooseStatWarp(pc.frame);
     ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
@@ -1248,17 +1449,30 @@ void main() {
 
     vec3 camOrigin = (pc.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
     vec3 camForward = normalize((pc.invView * vec4(0.0, 0.0, -1.0, 0.0)).xyz);
-    // With a still camera a pixel keeps its reservoir; otherwise it starts empty.
     bool keepRes = (pc.flags & FLAG_HISTORY_VALID) != 0u && !moved;
     imageStore(curReservoir, pixel, keepRes ? imageLoad(prevReservoir, pixel) : vec4(0.0));
 
-    // 1. Primary ray through the pixel center identifies the visible surface.
     vec2 ndcC = (vec2(pixel) + 0.5) / size * 2.0 - 1.0;
     ndcC.y = -ndcC.y;
     vec4 tC = pc.invProj * vec4(ndcC, 1.0, 1.0);
     vec3 dirC = normalize((pc.invView * vec4(normalize(tC.xyz / tC.w), 0.0)).xyz);
-    traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, camOrigin, 0.0, dirC, 1e4, 0);
-    flushStat(STAT_CENTER, 1u);
+    if (pc.debugMode == 8u) {
+        traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 1, 0, camOrigin, 0.0, dirC, 1e4, 0);
+        uint traced = payload.hitT >= 0.0 ? payload.instanceIndex + 1u : 0u;
+        uint rastered = imageLoad(visibility, pixel).x;
+        uint hsh = pcgHash(rastered * 7919u + 13u);
+        vec3 c = rastered == 0u ? vec3(0.02) : vec3(hsh & 255u, (hsh >> 8u) & 255u, (hsh >> 16u) & 255u) / 255.0 * 0.8 + 0.1;
+        if (traced != rastered) c = vec3(1.0, 0.0, 0.0);
+        imageStore(curColor, pixel, vec4(c, 0.0));
+        imageStore(curGuideND, pixel, vec4(0.0));
+        imageStore(curGuideAlb, pixel, vec4(0.0));
+        imageStore(curMeta, pixel, vec4(1.0, 0.0, float(traced), 0.0));
+        imageStore(curSpecular, pixel, vec4(0.0));
+        imageStore(curSpecGuide, pixel, vec4(0.0, NO_MOTION, NO_MOTION, 1.0));
+        imageStore(curMotion, pixel, vec4(0.0));
+        return;
+    }
+    primaryHit(pixel, camOrigin, dirC);
 
     bool hit = payload.hitT >= 0.0;
     vec3 Ngc = payload.geoNormal;
@@ -1270,10 +1484,7 @@ void main() {
     if (hit) { float nv = dot(N, -dirC); if (nv < 0.05) N = normalize(N - dirC * (0.05 - nv)); }
     float viewDepth = hit ? dot(P - camOrigin, camForward) : 0.0;
     Material primaryMat = materials[hit ? payload.materialIndex : 0u];
-    float pixelSpread = 2.0 * pc.invProj[1][1] / size.y;   // ray cone spread angle of one pixel
-
-    // Request the visible surface's tiles every frame, even for converged pixels, so on-screen tiles are never
-    // evicted. Sampling happens below, only where needed.
+    float pixelSpread = 2.0 * pc.invProj[1][1] / size.y;
     Material primaryTex = primaryMat;
     vec2 primaryUV = payload.uv;
     float primaryLod = 0.0;
@@ -1281,16 +1492,11 @@ void main() {
     if (hit && primaryMat.textureSet >= 0) {
         uint set = uint(primaryMat.textureSet);
         primaryLod = vtLod(set, payload.texelDensity, primaryMat.uvScale, pixelSpread * payload.hitT, abs(dot(payload.normal, dirC)));
-        // Sampling rounds the LOD stochastically, so both neighboring mips must be resident.
         uint lodFloor = uint(max(primaryLod, 0.0));
         vtRequestTile(set, primaryUV * primaryMat.uvScale, lodFloor, payload.hitT);
         vtRequestTile(set, primaryUV * primaryMat.uvScale, lodFloor + 1u, payload.hitT);
     }
     bool animated = (pc.flags & FLAG_ANIMATED) != 0u;
-
-    // Primary surface replacement. Behind flat glass the history follows the surface seen through it: the camera
-    // ray passes a pane almost straight, so that surface's position, motion and guides stand in for the pixel.
-    // Curved glass (lenses, balls) bends the view and keeps the glass surface.
     Material surfMat = primaryMat;
     bool psr = false;
     vec3 psrAlbedo = vec3(0.0);
@@ -1326,7 +1532,6 @@ void main() {
         }
     }
 
-    // Object motion: where this surface point was in the previous frame.
     vec3 Pprev = P, Nprev = N;
     if (animated && hit) {
         mat4 motion = instanceDelta[instance - 1u];
@@ -1334,7 +1539,6 @@ void main() {
         Nprev = normalize(mat3(motion) * N);
     }
 
-    // 2. Fetch this surface's history from the previous frame.
     gThroughGlass = psr;
     History h = emptyHistory();
     vec2 prevPixel = vec2(-1.0);
@@ -1350,41 +1554,37 @@ void main() {
         }
         if (any(isnan(h.color)) || any(isinf(h.color)) || any(isnan(h.specular)) || any(isinf(h.specular))) h = emptyHistory();
         if (moved && hit) capHistory(h, psr ? min(movingHistoryCap(surfMat), GLASS_MOVING_HISTORY) : movingHistoryCap(surfMat));
-        // At silhouettes part of the history belongs to another object that moves differently.
-        if (moved && h.edge > 0.02) capHistory(h, MIN_SAMPLES);
+        if (moved && h.edge > 0.02) {
+            if (opt(OPT_RASTER) && hit && !psr && pc.aperture <= 0.0 && !rasterSilhouette(pixel, instance)) {
+                h = emptyHistory();
+            } else {
+                capHistory(h, MIN_SAMPLES);
+            }
+        }
     }
-    // Glass and mirrors show content that moves differently from the surface, so the temporal filter must not
-    // reuse them. Glossy metals keep it: their blurred reflections drift slowly and the neighborhood clamp limits
-    // the lag. Silhouettes keep it too, otherwise model edges would show raw noise while the camera moves.
-    // The motion image's w is the least weight the temporal filter gives the current frame: 1 for these, more than
-    // 0 where a moving object changes the light (set below), 0 elsewhere.
     bool viewDependent = hit && (surfMat.transmission > 0.5 || (surfMat.metallic > 0.5 && surfMat.roughness < 0.15));
     vec4 motion = reprojected ? vec4(prevPixel - (vec2(pixel) + 0.5), 1.0, viewDependent ? 1.0 : 0.0) : vec4(0.0);
 
-    // Shorten the history only where a moving object can change the light.
     float influence = 0.0;
     bool movingSurface = false;
     if (animated && hit) {
-        // A moving object skips its own zone, which would count as a moving shadow on every lit point of it.
         bool self = (instances[instance - 1u].flags & 1u) != 0u;
         movingSurface = self;
         influence = dynamicInfluence(camOrigin, P, N, dirC, surfMat, self ? instance : 0u,
                                      luminance(h.color.rgb + h.specular.rgb));
         capHistory(h, mix(limit, DYNAMIC_HISTORY, influence));
-        // A moving shadow would otherwise linger for many frames in the temporal filter.
         motion.w = max(motion.w, DYNAMIC_TEMPORAL_WEIGHT * influence);
         if (self) capHistory(h, min(movingHistoryCap(surfMat), surfMat.textureSet >= 0 ? MOVING_OBJECT_HISTORY : MOVING_HISTORY));
     }
-    // Silhouettes of moving objects: the history also holds samples of the other side, which has moved on.
     if (animated && h.edge > 0.02 && viewPassesDynamic(camOrigin, dirC)) capHistory(h, MIN_SAMPLES);
-    if (pc.debugMode == 6u) { // texture mips: color = mip used, red stripes = coarser fallback while loading
+    if (pc.debugMode == 6u) {
         vec3 c = vec3(0.25);
         if (hit && primaryMat.textureSet >= 0) {
             texturePrimary(primaryTex, primaryUV, primaryLod, primaryDist, seed);
             const vec3 mipColors[7] = vec3[7](vec3(1, 1, 1), vec3(0.2, 0.9, 0.2), vec3(0.2, 0.6, 1), vec3(0.9, 0.9, 0.2),
                                               vec3(0.9, 0.5, 0.1), vec3(0.7, 0.2, 0.9), vec3(0.5, 0.5, 0.5));
             c = mipColors[uint(min(gTexMipUsed, 6.0))] * (0.35 + 0.65 * primaryTex.albedo);
-            if (gTexStandIn > 0.0) c = mix(c, vec3(0.0, 0.9, 1.0) * (0.35 + 0.65 * primaryTex.albedo), gTexStandIn); // stand-in
+            if (gTexStandIn > 0.0) c = mix(c, vec3(0.0, 0.9, 1.0) * (0.35 + 0.65 * primaryTex.albedo), gTexStandIn);
             if (gTexMipUsed > gTexMipWanted && ((pixel.x + pixel.y) / 4) % 2 == 0) c = vec3(1, 0, 0);
         }
         imageStore(curColor, pixel, vec4(c, 0.0));
@@ -1396,12 +1596,9 @@ void main() {
         imageStore(curMotion, pixel, motion);
         return;
     }
-    // Per-pixel transport options: cache termination and indirect share.
     uint pixelIndex = uint(pixel.y) * gl_LaunchSizeEXT.x + uint(pixel.x);
     bool cachePaths = false;
 #ifdef LUMVEX_CACHE
-    // Also while objects move: the resolve pass keeps a short history in cells near moving objects, so the cache
-    // follows their light within a few frames (see cache.glsl).
     cachePaths = opt(OPT_CACHE_PATHS);
 #endif
     gTerminate = cachePaths;
@@ -1409,7 +1606,7 @@ void main() {
     uint indirectPeriod = 1u << indirectShift;
     uint indirectCell = indirectShift == 2u ? (uint(pixel.x) & 1u) + 2u * (uint(pixel.y) & 1u) : (uint(pixel.x + pixel.y) & 1u);
 
-    if (pc.debugMode == 5u) { // influence zones: blue = history kept, orange = restart
+    if (pc.debugMode == 5u) {
         vec3 c = hit ? mix(vec3(0.08, 0.15, 0.35), vec3(1.0, 0.45, 0.1), influence) * (0.4 + 0.6 * max(dot(N, -dirC), 0.0))
                      : vec3(0.02);
         imageStore(curColor, pixel, vec4(c, 0.0));
@@ -1422,7 +1619,6 @@ void main() {
         return;
     }
 
-    // 3. Converged pixels keep their history.
     if (h.count >= limit) {
         imageStore(curColor, pixel, h.color);
         imageStore(curGuideND, pixel, h.guideND);
@@ -1434,10 +1630,7 @@ void main() {
         return;
     }
 
-    // 4. New samples
     flushStat(STAT_PIXELS, 1u);
-
-    // ReSTIR: pick this frame's light sample for the visible surface.
     gResPacked = 0u;
     bool resSurface = hit && opt(OPT_RESTIR) && lightHeader.x > 0u && primaryMat.transmission < 0.5
             && !(primaryMat.metallic > 0.5 && primaryMat.roughness < 0.1) && (primaryMat.flags & MATERIAL_LIGHT_PROXY) == 0u;
@@ -1448,7 +1641,6 @@ void main() {
         tm.albedo = surfaceAlbedoPlain(primaryMat, P);
         Reservoir res;
         res.light = 0u; res.y = vec3(0.0); res.wsum = 0.0; res.M = 0.0;
-        // Candidates from the importance-sampled light cones, without rays.
         uint candidates = h.count == 0.0 ? RES_CANDIDATES_NEW : RES_CANDIDATES;
         for (uint c = 0u; c < candidates; ++c) {
             uint k;
@@ -1461,16 +1653,14 @@ void main() {
             float t = -b - sqrt(max(disc, 0.0));
             vec3 y = x + L * max(t, 0.0);
             float cosY = dot(normalize(y - lights[k].posRadius.xyz), -L);
-            float pdfA = pdfW * max(cosY, 1e-4) / max(t * t, 1e-8);     // solid angle to area measure
+            float pdfA = pdfW * max(cosY, 1e-4) / max(t * t, 1e-8);
             resUpdate(res, k, y, resTarget(x, N, V, tm, k, y) / pdfA, 1.0, seed);
         }
-        // Reuse the previous frame's choice and those of two neighbors with matching geometry.
         if ((pc.flags & FLAG_HISTORY_VALID) != 0u && prevPixel.x >= 0.0) {
             ivec2 pp = ivec2(prevPixel);
             if (all(greaterThanEqual(pp, ivec2(0))) && all(lessThan(pp, gSize)) && h.count > 0.0) {
                 resMerge(res, imageLoad(prevReservoir, pp), x, N, V, tm, seed);
             }
-            // Spatial reuse without MIS weights is biased (measured 5.6/255 too bright), so it is opt-in.
 #ifdef LUMVEX_RESTIR_SPATIAL
             for (uint n = 0u; n < RES_NEIGHBORS; ++n) {
                 vec2 off = sampleDisk(seed) * RES_RADIUS;
@@ -1487,7 +1677,6 @@ void main() {
         float pHat = res.wsum > 0.0 ? resTarget(x, N, V, tm, res.light, res.y) : 0.0;
         if (pHat > 0.0) {
             W = res.wsum / (res.M * pHat);
-            // An occluded choice is dropped, which keeps shadows sharp.
             vec3 toY = res.y - x;
             float d = length(toY);
             if (traceShadow(x, toY / d, d * 0.999)) W = 0.0;
@@ -1505,9 +1694,6 @@ void main() {
     float sumL2 = 0.0;
     vec3 sumSpec = vec3(0.0);
     float sumSpecAlb = 0.0, sumSpecHit = 0.0, specHits = 0.0, sumRoughness = 0.0;
-    // Fireflies: a sample far brighter than what the pixel has seen so far - a rare path that hit a small bright
-    // light - is cut back to a plausible brightness before it enters the history. The diffuse limit comes from the
-    // history's mean and spread, the specular one, without a second moment, from a multiple of its mean.
     float diffuseMean = luminance(h.color.rgb);
     float diffuseLimit = diffuseMean + FIREFLY_SIGMAS * sqrt(max(h.color.a - diffuseMean * diffuseMean, 0.0)) + FIREFLY_FLOOR;
     float specularLimit = FIREFLY_SPECULAR_RATIO * luminance(h.specular.rgb) + FIREFLY_FLOOR;
@@ -1516,22 +1702,19 @@ void main() {
     float guideSamples = 0.0;
     float edgeSamples = 0.0;
     float kept = 0.0;
-    // A newly visible pixel catches up with several samples in its first frame.
-    // Catch-up samples are for newly visible pixels only; a history capped by motion keeps one sample per frame.
     float wantedSamples = h.count == 0.0 ? max(float(pc.samplesPerFrame), float(lightHeader2.w)) : float(pc.samplesPerFrame);
-    // A moving object keeps a short history, so it traces more samples per frame instead; it covers few pixels.
     if (movingSurface) wantedSamples = max(wantedSamples, MOVING_OBJECT_SAMPLES);
     uint spp = uint(min(wantedSamples, max(limit - h.count, 1.0)));
     for (uint s = 0; s < spp; ++s) {
         bool pathTracing = pc.debugMode == 0u || pc.debugMode >= 3u;
         vec2 jitter = pathTracing ? vec2(rnd(seed), rnd(seed)) : vec2(0.5);
         vec2 ndc = (vec2(pixel) + jitter) / size * 2.0 - 1.0;
-        ndc.y = -ndc.y; // image rows go top to bottom
+        ndc.y = -ndc.y;
         vec4 target = pc.invProj * vec4(ndc, 1.0, 1.0);
         vec3 dirView = normalize(target.xyz / target.w);
 
         vec3 originView = vec3(0.0);
-        if (pc.aperture > 0.0) { // thin lens depth of field
+        if (pc.aperture > 0.0) {
             vec3 focusPoint = dirView * (pc.focusDistance / -dirView.z);
             originView = vec3(sampleDisk(seed) * pc.aperture, 0.0);
             dirView = normalize(focusPoint - originView);
@@ -1544,32 +1727,25 @@ void main() {
         g.normal = vec3(0.0); g.distance = 0.0; g.albedo = vec3(0.0); g.done = false; g.firstInstance = 0u;
         g.surfaceInstance = 0u; g.reflected = false;
         g.specAlbedo = vec3(0.0); g.roughness = 1.0; g.specular = vec3(0.0); g.specHit = 0.0;
-        // Indirect light on 1 / period of the samples, rotating over pixels and frames.
         gIndirectMode = indirectShift == 0u ? 0.0
                       : (indirectCell + pc.frame + s) % indirectPeriod == 0u ? float(indirectPeriod) : -1.0;
         gPathStats = 0u;
         vec3 c = pathTrace(origin, dir, seed, g, true, pc.maxBounces, pixelSpread);
         uint ps = gPathStats;
         flushPathStats(PATH_CAMERA);
-        if (pc.debugMode == 7u) { // path length: blue = 1 ray, red = max bounces, magenta = ended in the cache
+        if (pc.debugMode == 7u) {
             float t = clamp((float(ps & 255u) - 1.0) / max(float(pc.maxBounces) - 1.0, 1.0), 0.0, 1.0);
             c = t < 0.5 ? mix(vec3(0.05, 0.2, 1.0), vec3(1.0, 0.9, 0.1), t * 2.0) : mix(vec3(1.0, 0.9, 0.1), vec3(1.0, 0.1, 0.05), t * 2.0 - 1.0);
             if (((ps >> 16u) & 1u) != 0u) c = mix(c, vec3(1.0, 0.1, 1.0), 0.45);
         }
-        // Behind glass the surface the sample saw is the one after the pane; samples reflected by the pane belong
-        // to neither and are left out of the guides and the edge measure.
         uint seen = psr ? g.surfaceInstance : g.firstInstance;
         bool guide = !(psr && g.reflected);
-        // A background pixel whose sample hit a moving object would leave a trail in the history, since the
-        // object moves on by the next frame. Skip such samples while animating.
         if (animated && guide && seen != instance && seen != 0u && (instances[seen - 1u].flags & 1u) != 0u) continue;
         kept += 1.0;
-        // Clamp extreme fireflies to keep the image stable while it converges.
         vec3 spec = pc.debugMode == 7u ? vec3(0.0) : min(g.specular, c);
         float lum = dot(c, vec3(0.2126, 0.7152, 0.0722));
         if (lum > 100.0) { c *= 100.0 / lum; spec *= 100.0 / lum; }
         if (any(isnan(c)) || any(isinf(c)) || any(isnan(spec)) || any(isinf(spec))) { c = vec3(0.0); spec = vec3(0.0); }
-        // The history keeps the diffuse and the specular share apart; the diffuse second moment feeds the variance.
         vec3 diffuse = c - spec;
         if (h.count >= FIREFLY_MIN_HISTORY) {
             diffuse = limitLuminance(diffuse, diffuseLimit);
@@ -1590,7 +1766,7 @@ void main() {
         }
     }
     float n = kept;
-    if (n == 0.0) { // every sample was skipped; keep the capped history
+    if (n == 0.0) {
         imageStore(curColor, pixel, h.color);
         imageStore(curGuideND, pixel, h.guideND);
         imageStore(curGuideAlb, pixel, vec4(h.guideAlb, h.edge));
@@ -1600,22 +1776,23 @@ void main() {
         imageStore(curMotion, pixel, motion);
         return;
     }
-    vec4 frameColor = vec4(sum / n, sumL2 / n);   // diffuse; second moment, for the denoiser's variance
+    vec4 frameColor = vec4(sum / n, sumL2 / n);
     vec4 frameND = guideSamples > 0.0 ? sumNormalDepth / guideSamples : vec4(hit ? N : vec3(0.0), psrDistance);
     vec3 frameAlb = guideSamples > 0.0 ? sumAlbedo / guideSamples : psrAlbedo;
-    float frameEdge = guideSamples > 0.0 ? edgeSamples / guideSamples : 0.0; // samples seeing another object
-
-    // 5. Blend into the history as a running mean over all samples of this surface.
-    // At a silhouette in motion the history also holds samples of the object beside it. Next to a lamp bulb those
-    // are a hundred times brighter and would trail behind it as a row of arcs, one per frame; a history far
-    // brighter than this frame's samples is dropped.
+    float frameEdge = guideSamples > 0.0 ? edgeSamples / guideSamples : 0.0;
     if (moved && h.edge > 0.02
             && luminance(h.color.rgb) > EDGE_REJECT_RATIO * luminance(frameColor.rgb) + EDGE_REJECT_FLOOR) h.count = 0.0;
     float total = h.count + n;
     float w = n / total;
+    vec3 albedoOut = mix(h.guideAlb, frameAlb, w);
+    if (moved && hit && h.count > 0.0 && guideSamples > 0.0) {
+        albedoOut = mix(h.guideAlb, frameAlb, max(w, MOVING_ALBEDO_WEIGHT));
+        vec3 ratio = demodulationAlbedo(albedoOut) / demodulationAlbedo(h.guideAlb);
+        h.color.rgb *= ratio;
+        float lr = luminance(ratio);
+        h.color.a *= lr * lr;
+    }
     vec4 color = mix(h.color, frameColor, w);
-
-    // The specular share follows the reflection: see reprojectSpecular.
     float frameHit = specHits > 0.0 ? sumSpecHit / specHits : h.specular.a;
     vec4 frameSpec = vec4(sumSpec / n, frameHit);
     vec4 frameSpecGuide = guideSamples > 0.0 ? vec4(sumSpecAlb, 0.0, 0.0, sumRoughness) / guideSamples : h.specGuide;
@@ -1625,17 +1802,13 @@ void main() {
     if (moved && hit && h.count > 0.0) {
         float roughness = frameSpecGuide.a;
         bool dynamicSurface = animated && (instances[instance - 1u].flags & 1u) != 0u;
-        // Only sharp reflections sit at one virtual point; a wide lobe mixes many distances and moves more like
-        // the surface itself.
         vec2 virtualPos;
         bool followed = roughness < VIRTUAL_REPROJECTION_ROUGHNESS && !dynamicSurface && frameHit > 0.0
                 && reprojectSpecular(P + dirC * frameHit, instance, N, hSpec, hSpecGuide, virtualPos);
         if (followed) {
             specMotion = virtualPos - (vec2(pixel) + 0.5);
-            // The virtual point is exact for flat reflectors only; a bounded history keeps errors from piling up.
             specCount = min(specCount, SPECULAR_MOVING_HISTORY);
         } else {
-            // Reprojected with the surface: only a short history is safe on sharp reflectors.
             hSpec = h.specular;
             hSpecGuide = h.specGuide;
             specCount = min(specCount, mix(MIN_SAMPLES, MOVING_HISTORY, clamp(roughness / 0.4, 0.0, 1.0)));
@@ -1646,10 +1819,6 @@ void main() {
     vec4 specGuide = mix(hSpecGuide, frameSpecGuide, ws);
     specGuide.yz = specMotion;
 #ifdef LUMVEX_CACHE
-    // The first samples of a newly visible surface are often dark. Albedo times the cached light is a good guess,
-    // so it is blended in with the weight of PRIOR_SAMPLES samples. The stored count only includes real samples,
-    // so later samples dilute the guess, to about 2% at 100 samples.
-    // Not next to moving objects, where the cache still holds the old light (see nearDynamic).
     if (h.count == 0.0 && hit && !psr && opt(OPT_PRIOR) && opt(OPT_CACHE_PATHS) && pc.debugMode == 0u && !nearDynamic(P)
             && movingHistoryCap(primaryMat) >= MOVING_HISTORY
             && dot(primaryMat.emission, primaryMat.emission) == 0.0 && (primaryMat.flags & MATERIAL_LIGHT_PROXY) == 0u) {
@@ -1666,7 +1835,7 @@ void main() {
 #endif
     imageStore(curColor, pixel, color);
     imageStore(curGuideND, pixel, mix(h.guideND, frameND, w));
-    imageStore(curGuideAlb, pixel, vec4(mix(h.guideAlb, frameAlb, w), mix(h.edge, frameEdge, w)));
+    imageStore(curGuideAlb, pixel, vec4(albedoOut, mix(h.edge, frameEdge, w)));
     imageStore(curMeta, pixel, vec4(min(total, limit), viewDepth, float(instance), encodeMetaNormal(hit ? N : -dirC, psr)));
     imageStore(curSpecular, pixel, specular);
     imageStore(curSpecGuide, pixel, specGuide);

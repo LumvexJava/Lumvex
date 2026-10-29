@@ -54,12 +54,20 @@ public final class RtPipeline implements AutoCloseable {
     public final VkStridedDeviceAddressRegionKHR hitRegion = VkStridedDeviceAddressRegionKHR.calloc();
     public final VkStridedDeviceAddressRegionKHR callableRegion = VkStridedDeviceAddressRegionKHR.calloc();
 
+    /**
+     * Creates the descriptor set layout (see the class comment; binding 16 holds the atlases of the near and far pool,
+     * three channels each), compiles the shaders (the training pass is raygen.rgen compiled with its own main()),
+     * and builds the pipeline with five groups (raygen, training raygen, miss, shadow miss, triangle hit group) and
+     * its shader binding table, with room to align its start address.
+     */
     public RtPipeline(VkContext ctx, ShaderCompiler compiler) {
         this.ctx = ctx;
         VkDevice device = ctx.device;
         try (MemoryStack stack = stackPush()) {
-            int[] images = {1, 2, 5, 6, 7, 8, 9, 10, 12, 23, 24, 26, 27, 28, 29};
-            VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(14 + images.length, stack);
+            int[] images = {1, 2, 5, 6, 7, 8, 9, 10, 12, 23, 24, 26, 27, 28, 29, 30};
+            VkDescriptorSetLayoutBinding.Buffer bindings = VkDescriptorSetLayoutBinding.calloc(15 + images.length, stack);
+            bindings.get(14 + images.length).binding(31).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             bindings.get(13 + images.length).binding(25).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_ANY_HIT_BIT_KHR);
             bindings.get(12 + images.length).binding(22).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
@@ -68,7 +76,6 @@ public final class RtPipeline implements AutoCloseable {
                     .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             bindings.get(10 + images.length).binding(20).descriptorType(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER).descriptorCount(1)
                     .stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
-            // 16: atlases for the near and far pool, three channels each
             bindings.get(6 + images.length).binding(16).descriptorType(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(6).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             for (int k = 0; k < 3; k++) {
@@ -102,7 +109,6 @@ public final class RtPipeline implements AutoCloseable {
             pipelineLayout = lp.get(0);
 
             long raygen = compiler.createModule(ctx, "raygen.rgen", shaderc_glsl_raygen_shader);
-            // The training pass is the same source compiled with its own main().
             long trainRaygen = compiler.createModule(ctx, "raygen.rgen", shaderc_glsl_raygen_shader, "LUMVEX_TRAIN_PASS");
             long miss = compiler.createModule(ctx, "miss.rmiss", shaderc_glsl_miss_shader);
             long shadowMiss = compiler.createModule(ctx, "shadow.rmiss", shaderc_glsl_miss_shader);
@@ -118,7 +124,6 @@ public final class RtPipeline implements AutoCloseable {
             stages.get(4).sType$Default().stage(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR).module(closestHit).pName(main);
             stages.get(5).sType$Default().stage(VK_SHADER_STAGE_ANY_HIT_BIT_KHR).module(anyHit).pName(main);
 
-            // Groups: raygen, training raygen, miss, shadow miss, triangle hit group.
             VkRayTracingShaderGroupCreateInfoKHR.Buffer groups = VkRayTracingShaderGroupCreateInfoKHR.calloc(5, stack);
             for (int i = 0; i < 4; i++) {
                 groups.get(i).sType$Default()
@@ -163,7 +168,6 @@ public final class RtPipeline implements AutoCloseable {
             long raygenSize = align(handleStride, base);
             long missSize = align(2L * handleStride, base);
             long hitSize = align(handleStride, base);
-            // extra room to align the start address
             long total = 2 * raygenSize + missSize + hitSize + base;
             sbt = new Buffer(ctx, total,
                     VK_BUFFER_USAGE_SHADER_BINDING_TABLE_BIT_KHR | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,

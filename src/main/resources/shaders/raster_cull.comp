@@ -1,0 +1,129 @@
+#version 460
+// GPU culling for the raster pre-pass (see RasterPrepass.java), in two phases per frame. One thread per entry of the
+// draw list: the instance's mesh bounds are moved to world space and tested against the view frustum.
+//
+// Phase 0 appends the instances that were visible in the last frame; they are drawn first and their depth becomes
+// the Hi-Z pyramid (hiz.comp). Phase 1 tests every instance in the frustum against that pyramid: one that is not
+// hidden behind the depth drawn so far and was not drawn in phase 0 is appended to the second set of draws; whether
+// it is visible is kept for the next frame. Anything that comes into view is drawn in the same frame (no popping).
+//
+// Each visible instance also picks its level of detail (MeshLod.java): the coarsest level whose geometric error,
+// projected to the screen at the instance's distance, stays below the pixel threshold. It is appended to the culled
+// list range of its mesh, level and phase, and counted in that draw's indirect command, whose instanceCount the host
+// reset to 0; next to it goes the level's first triangle in the shared index buffer, for the visibility buffer.
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, scalar) readonly buffer InstanceTransforms { mat4x3 objectToWorld[]; };
+layout(set = 0, binding = 1, std430) readonly buffer DrawList { uint drawInstance[]; };
+layout(set = 0, binding = 2, std430) readonly buffer DrawGroup { uint drawGroup[]; };
+// Per mesh group: local bounds min (xyz), max (xyz).
+layout(set = 0, binding = 3, std430) readonly buffer GroupBounds { vec4 groupBounds[]; };
+struct DrawCommand { uint indexCount; uint instanceCount; uint firstIndex; int vertexOffset; uint firstInstance; };
+layout(set = 0, binding = 4, std430) buffer Commands { DrawCommand commands[]; };
+layout(set = 0, binding = 5, std430) writeonly buffer CulledList { uint culledInstance[]; };
+// Per mesh group: x = number of levels, yzw = errors of levels 1..3 in mesh units; first triangle of each level.
+struct GroupLod { vec4 error; uvec4 firstTri; };
+layout(set = 0, binding = 9, std430) readonly buffer GroupLods { GroupLod groupLod[]; };
+layout(set = 0, binding = 10, std430) writeonly buffer CulledFirstTri { uint culledFirstTri[]; };
+
+const uint LEVELS = 4u;   // MeshLod.MAX_LEVELS
+// Per draw list entry: 1 if the instance was visible in the last frame.
+layout(set = 0, binding = 6, std430) buffer VisibleLast { uint visibleLast[]; };
+layout(set = 0, binding = 7, std430) readonly buffer Params {
+    mat4 viewProj;    // reversed-Z projection times view, of the visibility buffer (y up)
+    vec4 planes[5];   // left, right, bottom, top, eye plane; inside where dot(plane.xyz, p) + plane.w >= 0
+    uvec4 counts;     // entries in the draw list, mesh groups, Hi-Z levels, occlusion culling on
+    vec4 screen;      // visibility buffer width, height; Hi-Z level 0 width, height
+    vec4 camera;      // xyz: camera position; w: screen pixels per unit of error at distance 1, over the threshold
+} prm;
+
+// The coarsest level of detail whose error stays below the threshold on screen.
+uint levelOf(uint g, vec3 c, vec3 ext, mat4x3 m) {
+    GroupLod l = groupLod[g];
+    uint levels = uint(l.error.x);
+    if (levels <= 1u) return 0u;
+    float scale = max(length(m[0]), max(length(m[1]), length(m[2])));
+    float dist = max(length(c - prm.camera.xyz) - length(ext), 1e-3);
+    float perError = scale / dist * prm.camera.w;
+    uint level = 0u;
+    for (uint k = 1u; k < levels; ++k) if (l.error[k] * perError <= 1.0) level = k;
+    return level;
+}
+// Hi-Z: level 0 is the farthest (smallest reversed) depth of each 2x2 block of the depth buffer, every further
+// level of each 2x2 block of the one before.
+layout(set = 0, binding = 8) uniform sampler2D hiz;
+
+layout(push_constant) uniform Phase { uint phase; } pc;
+
+// Whether the box (world center c, half extent ext) may be visible: not hidden behind the Hi-Z. A box reaching
+// behind the camera is kept. Its nearest depth (reversed: larger is nearer) is compared with the farthest depth of
+// the 2 x 2 texels of the level at which its screen rectangle spans at most that (level L texels cover 2^(L+1)
+// pixels).
+bool notOccluded(vec3 c, vec3 ext) {
+    vec2 lo = vec2(1e30), hi = vec2(-1e30);
+    float nearest = 0.0;
+    for (int k = 0; k < 8; ++k) {
+        vec3 corner = c + ext * vec3((k & 1) != 0 ? 1.0 : -1.0, (k & 2) != 0 ? 1.0 : -1.0, (k & 4) != 0 ? 1.0 : -1.0);
+        vec4 clip = prm.viewProj * vec4(corner, 1.0);
+        if (clip.w <= 1e-3) return true;
+        vec3 ndc = clip.xyz / clip.w;
+        vec2 px = vec2(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * prm.screen.xy;
+        lo = min(lo, px);
+        hi = max(hi, px);
+        nearest = max(nearest, ndc.z);
+    }
+    lo = clamp(lo, vec2(0.0), prm.screen.xy - 1.0);
+    hi = clamp(hi, vec2(0.0), prm.screen.xy - 1.0);
+    float span = max(hi.x - lo.x, hi.y - lo.y);
+    int level = clamp(int(ceil(log2(max(span, 1.0)))) - 1, 0, int(prm.counts.z) - 1);
+    ivec2 t0, t1;
+    for (;;) {
+        float texel = exp2(float(level + 1));
+        t0 = ivec2(floor(lo / texel));
+        t1 = ivec2(floor(hi / texel));
+        if ((t1.x - t0.x <= 1 && t1.y - t0.y <= 1) || level >= int(prm.counts.z) - 1) break;
+        level++;
+    }
+    ivec2 size = textureSize(hiz, level);
+    t0 = clamp(t0, ivec2(0), size - 1);
+    t1 = clamp(t1, ivec2(0), size - 1);
+    float farthest = min(min(texelFetch(hiz, t0, level).r, texelFetch(hiz, ivec2(t1.x, t0.y), level).r),
+                         min(texelFetch(hiz, ivec2(t0.x, t1.y), level).r, texelFetch(hiz, t1, level).r));
+    return nearest >= farthest;
+}
+
+// Culls one draw list entry: world bounds (center plus the absolute extent rotated by the transform), the frustum
+// test with each plane's farthest corner, then the phase's occlusion rule; a visible instance is appended to its draw.
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= prm.counts.x) return;
+    uint inst = drawInstance[i];
+    uint g = drawGroup[i];
+    vec3 lo = groupBounds[2u * g].xyz, hi = groupBounds[2u * g + 1u].xyz;
+    mat4x3 m = objectToWorld[inst];
+    vec3 c = m * vec4((lo + hi) * 0.5, 1.0);
+    vec3 e = (hi - lo) * 0.5;
+    vec3 ext = abs(m[0]) * e.x + abs(m[1]) * e.y + abs(m[2]) * e.z;
+    bool inFrustum = true;
+    for (int p = 0; p < 5; ++p) {
+        vec3 n = prm.planes[p].xyz;
+        if (dot(n, c) + dot(abs(n), ext) + prm.planes[p].w < 0.0) inFrustum = false;
+    }
+    bool occlusion = prm.counts.w != 0u;
+    if (pc.phase == 0u) {
+        if (!inFrustum || (occlusion && visibleLast[i] == 0u)) return;
+    } else {
+        if (!occlusion) return;
+        bool visible = inFrustum && notOccluded(c, ext + 1e-3);
+        bool drawn = visibleLast[i] != 0u;
+        visibleLast[i] = visible ? 1u : 0u;
+        if (!visible || drawn) return;
+    }
+    uint level = levelOf(g, c, ext, m);
+    uint cmd = (pc.phase * prm.counts.y + g) * LEVELS + level;
+    uint slot = atomicAdd(commands[cmd].instanceCount, 1u);
+    culledInstance[commands[cmd].firstInstance + slot] = inst;
+    culledFirstTri[commands[cmd].firstInstance + slot] = groupLod[g].firstTri[level];
+}

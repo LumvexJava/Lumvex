@@ -325,16 +325,12 @@ public final class SceneBuilder {
      */
     public boolean moveScripted(SceneDoc doc, Set<String> movedIds) {
         if (movedIds.isEmpty()) return false;
-        Set<String> all = new HashSet<>(movedIds);
-        boolean grew = true;
-        while (grew) {
-            grew = false;
-            for (Entity e : doc.entities) if (e.parent != null && all.contains(e.parent) && all.add(e.id)) grew = true;
-        }
+        Set<String> all = doc.withDescendants(movedIds);
         Matrix4f world = new Matrix4f();
         boolean any = false, lights = false;
-        for (Entity e : doc.entities) {
-            if (!all.contains(e.id)) continue;
+        for (String id : all) {
+            Entity e = doc.find(id);
+            if (e == null) continue;
             doc.worldMatrix(e, world);
             List<InstanceRef> refs = entityInstances.get(e.id);
             if (refs != null) {
@@ -680,6 +676,7 @@ public final class SceneBuilder {
         return cachedMaterial("default", () -> Material.diffuse(0.7f, 0.7f, 0.7f));
     }
 
+    /** The render material of a material definition, registering its texture set on first use. */
     private Material toMaterial(MaterialDef d) {
         int set = -1;
         if (d.textures != null) {
@@ -690,17 +687,20 @@ public final class SceneBuilder {
         }
         return new Material(new Vector3f(d.albedo[0], d.albedo[1], d.albedo[2]), d.roughness, d.metallic,
                 new Vector3f(d.emission[0], d.emission[1], d.emission[2]), d.ior, d.transmission, 0f,
-                set, d.uvScale, d.normalStrength, d.lightProxy ? Material.LIGHT_PROXY : 0);
+                set, d.uvScale, d.normalStrength, d.lightProxy ? Material.LIGHT_PROXY : 0, d.textures != null ? d.parallax : 0f);
     }
 
     /**
-     * Applies the scene settings. The HDR panorama is only reloaded when it changed; its sun is extracted and, if
-     * requested, rotated, and then replaces the sun from the settings.
+     * HDRI + Sun
      */
     private void applySettings(Settings s) throws IOException {
         scene.night = s.night;
         scene.exposure = s.exposure;
         scene.skyIntensity = s.skyIntensity;
+        scene.hazeDensity = s.hazeDensity;
+        scene.hazeFalloff = s.hazeFalloff;
+        scene.hazeSun = s.hazeSun;
+        scene.hazeColor.set(s.hazeColor[0], s.hazeColor[1], s.hazeColor[2]);
         if (!Objects.equals(s.environment, loadedEnvironment) || s.environmentSunU != loadedEnvironmentSunU) {
             scene.environment = null;
             if (s.environment != null) {
@@ -716,9 +716,15 @@ public final class SceneBuilder {
         if (scene.environment != null) {
             scene.night = false;
             scene.skyIntensity = s.environmentStrength;
-            scene.sunDirection.set(scene.environment.sunDirection);
-            scene.sunColor.set(scene.environment.sunColor);
-            scene.sunIntensity = scene.environment.sunIrradiance * s.environmentStrength;
+            if (s.sunFromEnvironment) {
+                scene.sunDirection.set(scene.environment.sunDirection);
+                scene.sunColor.set(scene.environment.sunColor);
+                scene.sunIntensity = scene.environment.sunIrradiance * s.environmentStrength;
+            } else {
+                scene.sunDirection.set(s.sunDirection[0], s.sunDirection[1], s.sunDirection[2]).normalize();
+                scene.sunColor.set(s.sunColor[0], s.sunColor[1], s.sunColor[2]);
+                scene.sunIntensity = s.sunIntensity;
+            }
         }
     }
 

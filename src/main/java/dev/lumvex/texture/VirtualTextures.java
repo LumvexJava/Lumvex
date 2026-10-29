@@ -23,7 +23,6 @@ import static dev.lumvex.texture.TextureSet.*;
 import static dev.lumvex.vk.VkUtil.check;
 import static org.lwjgl.system.MemoryStack.stackPush;
 import static org.lwjgl.system.MemoryUtil.*;
-import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
 import static org.lwjgl.vulkan.VK13.*;
 
 /**
@@ -118,6 +117,14 @@ public final class VirtualTextures implements AutoCloseable {
     /**
      * Sets up the tile directory, atlases and buffers. The coarsest mip of every set is uploaded right away and
      * pinned as a permanent fallback; the similarity search starts in the background.
+     * <ul>
+     * <li>The feedback buffer lives in VRAM, since every texture lookup updates it with an atomic; the CPU reads a
+     * copy.</li>
+     * <li>Compressed tiles are encoded on the GPU where shaders have 64-bit integers, else by a few CPU workers (BC7
+     * takes about 5 ms per tile; more workers would compete with the render thread). The GPU encoder reads the raw
+     * tiles from a compute shader, so the upload buffer is put in VRAM through the BAR, and with only the raw copy
+     * limiting uploads, the upload budget is raised.</li>
+     * </ul>
      */
     public VirtualTextures(VkContext ctx, List<TextureSet> sets, int slotsPerRow, boolean compress, ShaderCompiler compiler) {
         this.ctx = ctx;
@@ -156,10 +163,10 @@ public final class VirtualTextures implements AutoCloseable {
         }
 
         int[] rawFmt = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_UNORM};
-        int[][] bcFmt = {{VK_FORMAT_BC7_SRGB_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC7_UNORM_BLOCK},
-                         {VK_FORMAT_BC1_RGB_SRGB_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_BC1_RGB_UNORM_BLOCK}};
-        BlockCompression.Encoder[][] bcEnc = {{BlockCompression.BC7, BlockCompression.BC5, BlockCompression.BC7},
-                                              {BlockCompression.BC1, BlockCompression.BC5, BlockCompression.BC1}};
+        int[][] bcFmt = {{VK_FORMAT_BC7_SRGB_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM},
+                         {VK_FORMAT_BC1_RGB_SRGB_BLOCK, VK_FORMAT_BC5_UNORM_BLOCK, VK_FORMAT_R8G8B8A8_UNORM}};
+        BlockCompression.Encoder[][] bcEnc = {{BlockCompression.BC7, BlockCompression.BC5, null},
+                                              {BlockCompression.BC1, BlockCompression.BC5, null}};
         for (int p = 0; p < POOLS; p++) {
             for (int c = 0; c < CHANNELS; c++) {
                 int a = p * CHANNELS + c;
@@ -182,7 +189,6 @@ public final class VirtualTextures implements AutoCloseable {
         }
         pageTable = new Buffer(ctx, totalTiles * 16L, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, Buffer.UPLOAD);
         memSet(pageTable.map(), 0);
-        // Every texture lookup updates the feedback with an atomic, so it lives in VRAM and the CPU reads a copy.
         feedback = new Buffer(ctx, totalTiles * 4L, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
                 | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, Buffer.DEVICE);
         ctx.submitImmediate(c -> vkCmdFillBuffer(c, feedback.handle, 0, VK_WHOLE_SIZE, -1));
@@ -195,16 +201,13 @@ public final class VirtualTextures implements AutoCloseable {
             info.putInt(16 + s * 16, sets.get(s).size).putInt(20 + s * 16, sets.get(s).mipCount)
                     .putInt(24 + s * 16, firstTile[s]).putInt(28 + s * 16, 0);
         }
-        boolean gpu = this.compress && gpuEncode && compiler != null;
-        // with GPU encoding only the raw copy (~220 KB per tile) limits uploads
+        boolean gpu = this.compress && gpuEncode && compiler != null && ctx.shaderInt64Supported;
         if (gpu) uploadBudget = 64;
-        // The encoder reads the raw tiles from a compute shader, so the upload buffer is put in VRAM through the BAR.
         staging = new Buffer(ctx, (long) uploadBudget * rawTileBytes(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                 | (gpu ? VK_BUFFER_USAGE_STORAGE_BUFFER_BIT : 0), gpu ? Buffer.UPLOAD : Buffer.HOST);
         if (gpu) gpuEncoder = new GpuTileEncoder(ctx, compiler, staging, uploadBudget * Math.max(tileBytes(NEAR), tileBytes(FAR)),
                 uploadBudget * CHANNELS);
 
-        // A few workers suffice (BC7 takes ~5 ms per tile); more would compete with the render thread.
         workerCount = Math.clamp(Runtime.getRuntime().availableProcessors() / 4, 1, 8);
         workers = Executors.newFixedThreadPool(workerCount, r -> {
             Thread t = new Thread(r, "vt-worker");
@@ -225,7 +228,7 @@ public final class VirtualTextures implements AutoCloseable {
         if (!sets.isEmpty()) workers.submit(this::computeSimilarity);
 
         System.out.printf("[vt] %d sets, %d tiles (%.0f MB in RAM), %s, pools 2 x %d slots = %.0f MB VRAM, %s%n",
-                sets.size(), totalTiles, ramBytes() / 1048576.0, this.compress ? "BC7/BC5 near + BC1/BC5 far" : "RGBA8 (uncompressed)",
+                sets.size(), totalTiles, ramBytes() / 1048576.0, this.compress ? "BC7/BC5/RGBA8 near + BC1/BC5 far" : "RGBA8 (uncompressed)",
                 slotCount, poolBytes() / 1048576.0, gpuEncoder != null ? "encoded on the GPU" : workerCount + " encode workers");
     }
 
@@ -240,6 +243,18 @@ public final class VirtualTextures implements AutoCloseable {
         long b = 0;
         for (int c = 0; c < CHANNELS; c++) b += channelBytes(pool, c);
         return b;
+    }
+
+    /**
+     * Slots per row of both pools that fit into {@code budgetBytes} of VRAM, at most what the largest 2D image of the
+     * device allows. A slot holds one tile with its border in each channel: compressed, BC7 or BC1 albedo, BC5
+     * normals and RGBA8 ORM (about 212 KB for a near and a far slot); uncompressed, RGBA8 everywhere.
+     */
+    public static int slotsForBudget(long budgetBytes, boolean compress, int maxImageDimension) {
+        double texels = (double) SLOT * SLOT;
+        double perSlotPair = compress ? texels * (1 + 1 + 4 + 0.5 + 1 + 4) : texels * 4 * CHANNELS * POOLS;
+        int fit = (int) Math.floor(Math.sqrt(budgetBytes / perSlotPair));
+        return Math.max(8, Math.min(fit, maxImageDimension / SLOT));
     }
 
     /** VRAM used by both pools. */
@@ -318,8 +333,12 @@ public final class VirtualTextures implements AutoCloseable {
         ByteBuffer out = memAlloc((int) tileBytes(pool));
         int o = 0;
         for (int c = 0; c < CHANNELS; c++) {
-            set.extractTile(c, tileMip[tile], tileX[tile], tileY[tile], raw, 0);
-            encoder[pool * CHANNELS + c].encode(raw, 0, SLOT, SLOT, out, o);
+            BlockCompression.Encoder e = encoder[pool * CHANNELS + c];
+            if (e == null) set.extractTile(c, tileMip[tile], tileX[tile], tileY[tile], out, o);
+            else {
+                set.extractTile(c, tileMip[tile], tileX[tile], tileY[tile], raw, 0);
+                e.encode(raw, 0, SLOT, SLOT, out, o);
+            }
             o += (int) channelBytes(pool, c);
         }
         memFree(raw);
@@ -539,7 +558,7 @@ public final class VirtualTextures implements AutoCloseable {
         VkMemoryBarrier.Buffer mb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                 .srcAccessMask(VK_ACCESS_SHADER_WRITE_BIT)
                 .dstAccessMask(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, mb, null, null);
+        vkCmdPipelineBarrier(cmd, ctx.rtStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, mb, null, null);
         vkCmdCopyBuffer(cmd, feedback.handle, feedbackRead.handle, VkBufferCopy.calloc(1, stack).size(feedback.size));
         VkMemoryBarrier.Buffer cb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                 .srcAccessMask(VK_ACCESS_TRANSFER_READ_BIT).dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT);
@@ -549,7 +568,7 @@ public final class VirtualTextures implements AutoCloseable {
                 .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
                 .dstAccessMask(VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR, 0, hb, null, null);
+                VK_PIPELINE_STAGE_HOST_BIT | ctx.rtStage, 0, hb, null, null);
     }
 
     private static int bcCode(BlockCompression.Encoder e) {
@@ -583,7 +602,12 @@ public final class VirtualTextures implements AutoCloseable {
         return best;
     }
 
-    /** Uploads up to {@code uploadBudget} tiles and returns how many were uploaded. */
+    /**
+     * Uploads up to {@code uploadBudget} tiles into free or least recently used slots and returns how many were
+     * uploaded; tiles are skipped while their pool is full of tiles needed this frame. Tiles not yet encoded are copied
+     * raw and encoded on the GPU before their copy to the atlas. The page table gets the slot and the upload frame,
+     * for the fade-in.
+     */
     private int upload(VkCommandBuffer cmd, MemoryStack stack, List<Integer> tiles, boolean pin) {
         if (tiles.isEmpty()) return 0;
         ByteBuffer st = staging.map();
@@ -591,7 +615,6 @@ public final class VirtualTextures implements AutoCloseable {
         long offset = 0, encOffset = 0;
         int count = 0;
         VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, stack);
-        // {encoded offset, atlas, x, y}, copied after encoding
         List<long[]> gpuCopies = new ArrayList<>();
         if (gpuEncoder != null) gpuEncoder.begin();
         for (int tile : tiles) {
@@ -599,15 +622,13 @@ public final class VirtualTextures implements AutoCloseable {
             if (tileSlot[tile] >= 0) continue;
             int pool = poolOf(tileMip[tile]);
             int slot = findSlot(pool);
-            // pool full of tiles needed this frame
             if (slot < 0) continue;
             if (slotTile[pool][slot] >= 0) { evict(pool, slot, pt); evictionsByUpload++; }
             int sx = (slot % slotsPerRow) * SLOT, sy = (slot / slotsPerRow) * SLOT;
             ByteBuffer enc = compress ? encoded.get(tile) : null;
             long encOff = 0;
             for (int c = 0; c < CHANNELS; c++) {
-                if (compress && enc == null && gpuEncoder != null) {
-                    // Raw channel into the upload buffer; it is encoded on the GPU below.
+                if (compress && enc == null && gpuEncoder != null && encoder[pool * CHANNELS + c] != null) {
                     sets.get(tileSet[tile]).extractTile(c, tileMip[tile], tileX[tile], tileY[tile], st, (int) offset);
                     gpuEncoder.add(offset, encOffset, bcCode(encoder[pool * CHANNELS + c]), SLOT);
                     gpuCopies.add(new long[]{encOffset, pool * CHANNELS + c, sx, sy});
@@ -616,7 +637,7 @@ public final class VirtualTextures implements AutoCloseable {
                     continue;
                 }
                 long bytes = channelBytes(pool, c);
-                if (compress) {
+                if (compress && enc != null) {
                     memCopy(memAddress(enc) + encOff, memAddress(st) + offset, bytes);
                     encOff += bytes;
                 } else {
@@ -634,7 +655,6 @@ public final class VirtualTextures implements AutoCloseable {
             slotLastUsed[pool][slot] = frame;
             slotPinned[pool][slot] = pin;
             pt.putInt(tile * 16, entry(pool, slot));
-            // upload frame, for the fade-in
             pt.putInt(tile * 16 + 12, (int) frame);
             count++;
         }
@@ -652,7 +672,7 @@ public final class VirtualTextures implements AutoCloseable {
             VkMemoryBarrier.Buffer mb = VkMemoryBarrier.calloc(1, stack).sType$Default()
                     .srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
                     .dstAccessMask(VK_ACCESS_SHADER_READ_BIT);
-            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, ctx.rtStage,
                     0, mb, null, null);
         }
         return count;

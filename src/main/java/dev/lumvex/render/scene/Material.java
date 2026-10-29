@@ -13,12 +13,15 @@ import java.nio.ByteBuffer;
  * @param uvScale        texture repeats per UV unit (per meter on primitives)
  * @param normalStrength normal map strength; 0 disables the normal map
  * @param flags          combination of {@link #LIGHT_PROXY} and {@link #ALPHA_TEST}
+ * @param parallax       relief depth of the texture set's height map in meters (parallax occlusion mapping); 0 off
  */
 public record Material(Vector3f albedo, float roughness, float metallic,
                        Vector3f emission, float ior, float transmission, float checkerScale,
-                       int textureSet, float uvScale, float normalStrength, int flags) {
+                       int textureSet, float uvScale, float normalStrength, int flags, float parallax) {
 
     public static final int GPU_SIZE = 64;
+    /** {@code -Dlumvex.noparallax=true} turns parallax occlusion mapping off everywhere, for comparisons. */
+    private static final boolean NO_PARALLAX = Boolean.getBoolean("lumvex.noparallax");
 
     /**
      * Keeps the factors in their physical range. An albedo above 1 would reflect more light than arrives: the surface
@@ -29,6 +32,12 @@ public record Material(Vector3f albedo, float roughness, float metallic,
         roughness = Math.clamp(roughness, 0f, 1f);
         metallic = Math.clamp(metallic, 0f, 1f);
         transmission = Math.clamp(transmission, 0f, 1f);
+        parallax = Math.max(0f, parallax);
+    }
+
+    public Material(Vector3f albedo, float roughness, float metallic, Vector3f emission, float ior, float transmission,
+                    float checkerScale, int textureSet, float uvScale, float normalStrength, int flags) {
+        this(albedo, roughness, metallic, emission, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, flags, 0f);
     }
     /**
      * Marks the visible surface of a {@link Scene.SphereLight}, such as a candle flame. It is seen by the camera and
@@ -78,19 +87,24 @@ public record Material(Vector3f albedo, float roughness, float metallic,
     }
 
     public Material withChecker(float cellSize) {
-        return new Material(albedo, roughness, metallic, emission, ior, transmission, cellSize, textureSet, uvScale, normalStrength, flags);
+        return new Material(albedo, roughness, metallic, emission, ior, transmission, cellSize, textureSet, uvScale, normalStrength, flags, parallax);
     }
 
     public Material withTexture(int set, float scale, float normalMapStrength) {
-        return new Material(albedo, roughness, metallic, emission, ior, transmission, checkerScale, set, scale, normalMapStrength, flags);
+        return new Material(albedo, roughness, metallic, emission, ior, transmission, checkerScale, set, scale, normalMapStrength, flags, parallax);
     }
 
     public Material withEmission(Vector3f e) {
-        return new Material(albedo, roughness, metallic, e, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, flags);
+        return new Material(albedo, roughness, metallic, e, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, flags, parallax);
     }
 
     public Material withFlags(int f) {
-        return new Material(albedo, roughness, metallic, emission, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, f);
+        return new Material(albedo, roughness, metallic, emission, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, f, parallax);
+    }
+
+    /** The same material with a relief depth in meters for its height map, see {@link #parallax}. */
+    public Material withParallax(float depth) {
+        return new Material(albedo, roughness, metallic, emission, ior, transmission, checkerScale, textureSet, uvScale, normalStrength, flags, depth);
     }
 
     public boolean isLightProxy() { return (flags & LIGHT_PROXY) != 0; }
@@ -110,6 +124,6 @@ public record Material(Vector3f albedo, float roughness, float metallic,
                 .putFloat(offset + 48, uvScale)
                 .putFloat(offset + 52, normalStrength)
                 .putInt(offset + 56, flags)
-                .putFloat(offset + 60, 0f);
+                .putFloat(offset + 60, NO_PARALLAX ? 0f : parallax);
     }
 }

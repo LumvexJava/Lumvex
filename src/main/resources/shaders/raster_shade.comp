@@ -1,0 +1,128 @@
+#version 460
+// Raster render mode (see RasterShade.java): shades the visibility buffer of the raster pre-pass without any ray
+// tracing, so it also runs on GPUs without hardware ray tracing. Per pixel: the surface rebuilt from the visibility
+// buffer (the same intersection as raygen's rasterPrimary), its textures and normal map from the virtual textures,
+// then direct sunlight (no shadows), sky light from the blurred environment, a sky reflection and emission. Writes the
+// images the path tracer writes, so the composite pass (haze, tone mapping, UI) and picking work unchanged.
+#define LUMVEX_RASTER_SHADE
+#include "common.glsl"
+#include "surface.glsl"
+#include "vt.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba32ui) uniform readonly uimage2D visibility;   // instance + 1, three vertex indices
+layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D outColor;
+layout(set = 0, binding = 2, rgba32f) uniform writeonly image2D outGuideND;   // normal, distance (the haze reads it)
+layout(set = 0, binding = 3, scalar) readonly buffer InstanceBuffer { InstanceInfo instances[]; };
+layout(set = 0, binding = 4, scalar) readonly buffer MaterialBuffer { Material materials[]; };
+layout(set = 0, binding = 5, rgba32f) uniform writeonly image2D outMeta;      // samples, view depth, instance + 1
+layout(set = 0, binding = 6, rgba32f) uniform writeonly image2D outSpecular;  // cleared: no separate specular share
+layout(set = 0, binding = 7, scalar) readonly buffer InstanceTransforms { mat4x3 objectToWorld[]; };
+layout(set = 0, binding = 8, rgba16f) uniform writeonly image2D outGuideAlb;
+layout(set = 0, binding = 21) uniform sampler2D envMap;
+
+const float SKY_OPEN = 0.65;
+
+// The environment, blurred by its mip chain: lod 0 is the panorama, 7 light from a wide cone.
+vec3 environmentLod(vec3 dir, float lod) {
+    if ((pc.flags & FLAG_ENV) == 0u) return skyColor(dir);
+    vec2 uv = vec2(0.5 + atan(dir.x, -dir.z) / (2.0 * PI), acos(clamp(dir.y, -1.0, 1.0)) / PI);
+    return textureLod(envMap, uv, lod).rgb * pc.skyIntensity;
+}
+
+// Shades one pixel. The hit is rebuilt by Moeller-Trumbore with clamped barycentrics, as raygen's rasterPrimary.
+// Glass shows the reflected sky and a hint of its tint. A Lambertian surface under sky light of mean radiance S
+// reflects albedo * S; without rays nothing hides the sky, so it is scaled by SKY_OPEN, a typical share of the
+// hemisphere that stays open (walls, eaves and neighbors cover the rest).
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(outColor);
+    if (any(greaterThanEqual(pixel, size))) return;
+
+    vec3 camOrigin = (pc.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 camForward = normalize((pc.invView * vec4(0.0, 0.0, -1.0, 0.0)).xyz);
+    vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 t = pc.invProj * vec4(ndc, 1.0, 1.0);
+    vec3 dir = normalize((pc.invView * vec4(normalize(t.xyz / t.w), 0.0)).xyz);
+
+    uvec4 vis = imageLoad(visibility, pixel);
+    vec3 c = environmentLod(dir, 0.0) + sunDisk(dir);
+    vec4 nd = vec4(0.0), meta = vec4(1.0, 0.0, 0.0, 0.0);
+    vec3 alb = vec3(0.0);
+    if (vis.x != 0u) {
+        uint index = vis.x - 1u;
+        InstanceInfo inst = instances[index];
+        Triangle tri = fetchTriangleVertices(inst, vis.yzw);
+        mat4x3 o2w = objectToWorld[index];
+        vec3 a = o2w * vec4(tri.p0, 1.0), b = o2w * vec4(tri.p1, 1.0), cc = o2w * vec4(tri.p2, 1.0);
+        vec3 e1 = b - a, e2 = cc - a;
+        vec3 pv = cross(dir, e2);
+        float det = dot(e1, pv);
+        if (abs(det) > 1e-10 * dot(e1, e1) * dot(e2, e2) + 1e-20) {
+            float inv = 1.0 / det;
+            vec3 tv = camOrigin - a;
+            vec3 qv = cross(tv, e1);
+            float hitT = max(dot(e2, qv) * inv, 0.0);
+            vec2 uv = clamp(vec2(dot(tv, pv), dot(dir, qv)) * inv, 0.0, 1.0);
+            if (uv.x + uv.y > 1.0) uv /= uv.x + uv.y;
+            mat3 toWorld = mat3(o2w);
+            HitPayload h = surfaceHit(tri, uv, toWorld, transpose(inverse(toWorld)), inst.materialIndex, index,
+                                      camOrigin + dir * hitT, hitT);
+            Material m = materials[h.materialIndex];
+            vec3 N = h.normal, Ng = h.geoNormal;
+            if (dot(Ng, dir) > 0.0) Ng = -Ng;
+            if (dot(N, dir) > 0.0) N = -N;
+            if (m.textureSet >= 0) {
+                uint set = uint(m.textureSet);
+                float pixelAngle = 2.0 * pc.invProj[1][1] / float(size.y);
+                float lod = vtLod(set, h.texelDensity, m.uvScale, pixelAngle * hitT, abs(dot(N, dir)));
+                uint seed = pcgHash(uint(pixel.y) * uint(size.x) + uint(pixel.x)) ^ pcgHash(pc.frame * 0x9E3779B9u);
+                VtSample s = vtSample(set, h.uv * m.uvScale, lod, hitT, seed, true);
+                m.albedo *= s.albedo.rgb * s.orm.x;
+                m.roughness *= s.orm.y;
+                m.metallic *= s.orm.z;
+                if (m.normalStrength > 0.0) {
+                    vec3 T = h.tangent, B = h.tangentSign * cross(N, T);
+                    vec3 nt = vec3(s.normal.xy * m.normalStrength, max(s.normal.z, 1e-3));
+                    N = normalize(T * nt.x + B * nt.y + N * nt.z);
+                }
+            }
+            vec3 V = -dir;
+            float NdotV = max(dot(N, V), 1e-4);
+            if (m.transmission > 0.5) {
+                float F = fresnelDielectric(NdotV, 1.0 / m.ior);
+                c = environmentLod(reflect(dir, N), 2.0) * F + m.albedo * 0.04 + m.emission;
+            } else {
+                vec3 diffuse = m.albedo * (1.0 - m.metallic);
+                vec3 F0 = mix(vec3(0.04), m.albedo, m.metallic);
+                float alpha = max(m.roughness * m.roughness, 2e-3);
+                vec3 L = normalize(pc.sunDirection);
+                float NdotL = dot(N, L);
+                vec3 sun = vec3(0.0);
+                if (pc.sunIntensity > 0.0 && NdotL > 0.0 && dot(Ng, L) > 0.0) {
+                    vec3 H = normalize(L + V);
+                    vec3 F = fresnelSchlick(F0, max(dot(V, H), 0.0));
+                    float spec = ggxD(max(dot(N, H), 0.0), alpha) * smithG1(NdotV, alpha) * smithG1(NdotL, alpha)
+                               / (4.0 * NdotV * NdotL + 1e-4);
+                    sun = (diffuse * (1.0 - F) / PI + F * spec) * pc.sunColor * pc.sunIntensity * NdotL;
+                }
+                vec3 sky = environmentLod(normalize(N + vec3(0.0, 0.6, 0.0)), 7.0) * SKY_OPEN;
+                vec3 Fr = fresnelSchlick(F0, NdotV);
+                vec3 reflection = environmentLod(reflect(dir, N), mix(1.0, 7.0, m.roughness)) * Fr;
+                c = diffuse * (1.0 - Fr) * sky + reflection + sun + m.emission;
+            }
+            float viewDepth = dot(h.position - camOrigin, camForward);
+            nd = vec4(N, hitT);
+            meta = vec4(1.0, viewDepth, float(index + 1u), 0.0);
+            alb = m.albedo;
+        }
+    }
+    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    imageStore(outColor, pixel, vec4(c, l * l));
+    imageStore(outGuideND, pixel, nd);
+    imageStore(outGuideAlb, pixel, vec4(alb, 0.0));
+    imageStore(outMeta, pixel, meta);
+    imageStore(outSpecular, pixel, vec4(0.0));
+}

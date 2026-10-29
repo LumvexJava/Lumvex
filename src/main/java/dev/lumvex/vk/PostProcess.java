@@ -27,8 +27,8 @@ import static org.lwjgl.vulkan.VK13.*;
  * The renderer double-buffers the history, so each descriptor set exists once per history parity.
  */
 public final class PostProcess implements AutoCloseable {
-    private static final int ATROUS_PC_SIZE = 32;
-    private static final int COMPOSITE_PC_SIZE = 44;
+    private static final int ATROUS_PC_SIZE = 40;
+    private static final int COMPOSITE_PC_SIZE = 128;
     private static final int TEMPORAL_PC_SIZE = 16;
     private static final int SPECULAR_PC_SIZE = 20;
 
@@ -61,6 +61,12 @@ public final class PostProcess implements AutoCloseable {
     public boolean demodulate = true;
     public boolean temporal = true;
     public float temporalAlphaMin = 0.2f, temporalGamma = 1.0f, temporalTrustSamples = 16f;
+    /**
+     * Strength of the disocclusion fix: the weight, in samples per sample of history advantage, that a newly visible
+     * pixel gives the illumination of converged neighbors on the same surface. 0 switches it off; the system
+     * property {@code lumvex.nofix} does so at startup.
+     */
+    public float disocclusionFix = Boolean.getBoolean("lumvex.nofix") ? 0f : 1f;
     /** Filter the specular share by its reflection footprint; off composites the raw specular history. */
     public boolean specularFilter = true;
     /** Largest reflection footprint the specular filter blurs, in traced pixels. */
@@ -73,7 +79,7 @@ public final class PostProcess implements AutoCloseable {
         int img = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, buf = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         try (MemoryStack stack = stackPush()) {
             atrousSetLayout = createSetLayout(stack, new int[]{img, img, img, img, img, img});
-            compositeSetLayout = createSetLayout(stack, new int[]{img, img, img, img, img, buf, img, img, buf, img, img, img, img, img});
+            compositeSetLayout = createSetLayout(stack, new int[]{img, img, img, img, img, buf, img, img, buf, img, img, img, img, img, img});
             specularSetLayout = createSetLayout(stack, new int[]{img, img, img, img, img, img});
             specularLayout = createPipelineLayout(stack, specularSetLayout, SPECULAR_PC_SIZE);
             specularPipeline = createComputePipeline(stack, compiler, "specular.comp", specularLayout);
@@ -87,7 +93,7 @@ public final class PostProcess implements AutoCloseable {
             compositePipeline = createComputePipeline(stack, compiler, "composite.comp", compositeLayout);
 
             VkDescriptorPoolSize.Buffer sizes = VkDescriptorPoolSize.calloc(2, stack);
-            sizes.get(0).type(img).descriptorCount(2 * (6 + 6 + 14 + 7 + 6 + 6 + 7));
+            sizes.get(0).type(img).descriptorCount(2 * (6 + 6 + 15 + 7 + 6 + 6 + 7));
             sizes.get(1).type(buf).descriptorCount(2 * 2);
             LongBuffer lp = stack.mallocLong(14);
             check(vkCreateDescriptorPool(device, VkDescriptorPoolCreateInfo.calloc(stack)
@@ -152,7 +158,7 @@ public final class PostProcess implements AutoCloseable {
                                   StorageImage output, Buffer flares, StorageImage[] filtered, Buffer ui,
                                   StorageImage specPingA, StorageImage specPingB, StorageImage[] specFiltered) {
         try (MemoryStack stack = stackPush()) {
-            VkWriteDescriptorSet.Buffer w = VkWriteDescriptorSet.calloc(2 * (6 + 6 + 14 + 7 + 6 + 6 + 7), stack);
+            VkWriteDescriptorSet.Buffer w = VkWriteDescriptorSet.calloc(2 * (6 + 6 + 15 + 7 + 6 + 6 + 7), stack);
             int i = 0;
             for (int p = 0; p < 2; p++) {
                 HistoryImages h = history[p];
@@ -174,6 +180,7 @@ public final class PostProcess implements AutoCloseable {
                 image(stack, w.get(i++), compositeSet[p], 11, specPingB);
                 image(stack, w.get(i++), compositeSet[p], 12, h.specGuide);
                 image(stack, w.get(i++), compositeSet[p], 13, specFiltered[p]);
+                image(stack, w.get(i++), compositeSet[p], 14, h.guideNormalDepth);
                 StorageImage[] st = {specPingA, specPingB, h.specGuide, h.meta, specFiltered[1 - p], specFiltered[p],
                         history[1 - p].meta};
                 for (int k = 0; k < 7; k++) image(stack, w.get(i++), specularTemporalSet[p], k, st[k]);
@@ -200,19 +207,29 @@ public final class PostProcess implements AutoCloseable {
                 .pBufferInfo(VkDescriptorBufferInfo.calloc(1, stack).buffer(buf.handle).range(VK_WHOLE_SIZE));
     }
 
-    /** Records variance estimation and the a-trous passes. Returns the image to composite: 1 = pingA, 2 = pingB. */
+    /**
+     * Records variance estimation (into pingA, the destination of setB), the disocclusion fix and the a-trous passes;
+     * each pass after the variance estimation swaps source and target, so an even number of them ends in pingA.
+     * Returns the image to composite: 1 = pingA, 2 = pingB.
+     */
     public int recordDenoise(VkCommandBuffer cmd, MemoryStack stack, int parity, int width, int height,
-                             int historyLimit, int iterations) {
+                             int historyLimit, int iterations, int frame) {
         ByteBuffer pc = stack.malloc(ATROUS_PC_SIZE);
+        pc.putInt(32, frame).putFloat(36, disocclusionFix);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, atrousPipeline);
 
-        // Variance estimation writes pingA, which is the destination of setB.
         dispatchAtrous(cmd, stack, pc, setB[parity], 0, 1, historyLimit, width, height);
-        for (int i = 0; i < iterations; i++) {
+        int pass = 0;
+        if (disocclusionFix > 0) {
             computeBarrier(cmd, stack);
-            dispatchAtrous(cmd, stack, pc, (i & 1) == 0 ? setA[parity] : setB[parity], 1, 1 << i, historyLimit, width, height);
+            dispatchAtrous(cmd, stack, pc, setA[parity], 2, 1, historyLimit, width, height);
+            pass++;
         }
-        return (iterations & 1) == 0 ? 1 : 2;
+        for (int i = 0; i < iterations; i++, pass++) {
+            computeBarrier(cmd, stack);
+            dispatchAtrous(cmd, stack, pc, (pass & 1) == 0 ? setA[parity] : setB[parity], 1, 1 << i, historyLimit, width, height);
+        }
+        return (pass & 1) == 0 ? 1 : 2;
     }
 
     // mode 0 estimates variance, mode 1 filters.
@@ -229,13 +246,15 @@ public final class PostProcess implements AutoCloseable {
     /** {@code source}: 0 = raw history, 1 = pingA, 2 = pingB, 3 = temporal result. */
     public void recordComposite(VkCommandBuffer cmd, MemoryStack stack, int parity, int width, int height,
                                 float scaleX, float scaleY, int marginX, int marginY, float exposure,
-                                int debugMode, int source, int specularSource, int historyLimit, float flareStrength) {
+                                int debugMode, int source, int specularSource, int historyLimit, float flareStrength,
+                                float[] haze) {
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compositePipeline);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, compositeLayout, 0, stack.longs(compositeSet[parity]), null);
         ByteBuffer pc = stack.malloc(COMPOSITE_PC_SIZE);
         pc.putFloat(0, exposure).putInt(4, debugMode).putInt(8, source).putInt(12, historyLimit).putFloat(16, flareStrength)
                 .putInt(20, demodulate && source != 0 ? 1 : 0).putInt(24, marginX).putInt(28, marginY)
-                .putFloat(32, scaleX).putFloat(36, scaleY).putInt(40, specularSource);
+                .putFloat(32, scaleX).putFloat(36, scaleY).putInt(40, specularSource).putInt(44, 0);
+        for (int k = 0; k < 20; k++) pc.putFloat(48 + 4 * k, haze[k]);
         vkCmdPushConstants(cmd, compositeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc);
         vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
     }

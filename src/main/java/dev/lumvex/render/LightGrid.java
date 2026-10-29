@@ -25,8 +25,14 @@ final class LightGrid {
     static final int MAX_CELLS = 4096;
     // 32 x 16 bit = 16 words = 2 entries of 8 words
     static final int ENTRIES_PER_CELL = 2;
-    /** Fraction of shadow rays that pick a light uniformly, so lights outside the cell lists stay reachable. */
-    static final float UNIFORM_SHARE = 0.1f;
+    /**
+     * Fraction of shadow rays that pick a light uniformly from all lights, which keeps lights outside the cell lists
+     * reachable and the estimator unbiased; 0, so it is off. It was 0.1, and in a
+     * town with 2,000 lamps it made the fireflies: where more than 31 lamps are near (ceiling lamps on every floor,
+     * wall lanterns, street lamps), a nearby lamp outside the list was picked with a probability of 0.1 / 2,000 and
+     * its light multiplied by 20,000, a bright dot wherever the history was short, mostly while moving.
+     */
+    static final float UNIFORM_SHARE = 0f;
     /** Margin around the lights' bounding box in meters. */
     private static final float MARGIN = 3f;
 
