@@ -127,14 +127,7 @@ In a scene file it is `"renderMode": "hybrid"` in `settings`. GPUs without hardw
 | `-Dlumvex.noraytracing=true` | ignores ray tracing hardware: raster mode on any GPU |
 | `-Dlumvex.gputimes=true` | prints the GPU time of the passes |
 
-## Documentation
 
-* [Hybrid rendering, render modes and the raster fallback](docs/HYBRID_RENDERING.md)
-* [Raster performance: culling and a lean frame](docs/RASTER_PERFORMANCE.md)
-* [Large scenes](docs/LARGE_SCENES.md)
-* [Relief: parallax occlusion mapping](docs/PARALLAX_MAPPING.md)
-* [Atmosphere: haze, sun and night sky](docs/ATMOSPHERE.md)
-* [Changelog](CHANGELOG.md)
 
 ## Working with Assets
 
