@@ -2,9 +2,7 @@
 
 Lumvex Core is a real-time rendering „engine“ written in Java. It has no UI interface per se but is completely bound by code (you have to write your scenes / gameplay logic / objects etc. in Java yourself (like it should be). Lumvex only handles the rendering so you can fully concentrate on your project.
 
-Under the hood, it runs on Vulkan 1.3 using hybrid rendering (rasterization + hardware ray tracing, with some/a lot of bugs), Jolt for physics, and shaderc to compile GLSL shaders at startup.
-
-Lumvex 1.2.0 is the second update: hybrid rendering, render modes per scene, a raster fallback for GPUs without ray tracing. 
+Under the hood, it runs on Vulkan 1.3 and Jolt for physics. The renderer is a Java port of the [kajiya](https://github.com/EmbarkStudios/kajiya) pipeline (rasterized G-buffer, ray traced sun shadows, an irradiance cache, ReSTIR diffuse GI, ReSTIR reflections, SSGI, TAA, motion blur and bloom/tonemapping). Its HLSL shaders are compiled to SPIR-V with `dxc` (see `tools/compile_kajiya_shaders.sh`); the compiled SPIR-V ships in the jar, so `dxc` is only needed when you change a shader.
 
 <img width="320" height="180" alt="01-autumn-atrium" src="https://github.com/user-attachments/assets/08faf122-6c93-4fab-8e70-179b9a175ba3" />
 <img width="320" height="180" alt="02-neon-reflections" src="https://github.com/user-attachments/assets/9421af78-d211-432f-8757-2179b23d85be" />
@@ -19,7 +17,7 @@ Lumvex 1.2.0 is the second update: hybrid rendering, render modes per scene, a r
 ## Building from Source (how to get started with setting up):
 You have to install maven by yourself (https://maven.apache.org/download.cgi)
 ```bash
-mvn package   # Builds target/lumvex-core-1.2.0.jar (+ sources) and copies dependencies to lib/
+mvn package   # Builds target/lumvex-core-1.3.0.jar (+ sources) and copies dependencies to lib/
 mvn install   # Installs the engine into your local Maven repository (~/.m2)
 ```
 After following the commands, you should be able to "add" the engine into IntelliJ using the pom.xml file (Maven Project):
@@ -28,14 +26,14 @@ After following the commands, you should be able to "add" the engine into Intell
 <dependency>
     <groupId>dev.lumvex</groupId>
     <artifactId>lumvex-core</artifactId>
-    <version>1.2.0</version>
+    <version>1.3.0</version>
 </dependency>
 ```
 
 Or with Gradle:
 ```kotlin
 repositories { mavenLocal() }
-dependencies { implementation("dev.lumvex:lumvex-core:1.2.0") }
+dependencies { implementation("dev.lumvex:lumvex-core:1.3.0") }
 ```
 
 
@@ -101,35 +99,22 @@ public class Spin extends ObjectScript {
 **[Tutorials & Doc (both unfinished)](https://github.com/LumvexJava/Lumvex/wiki)**
 
 
-## Render modes
+## Rendering
 
-Every scene picks how it is rendered:
-
-| Mode | What it does | GPU |
-| --- | --- | --- |
-| `hybrid` (default) | rasterized visible surfaces, path traced light | hardware ray tracing |
-| `path` | everything path traced, the renderer of Lumvex 1.0 | hardware ray tracing |
-| `raster` | rasterization only: textures, sunlight without shadows, sky light, reflections of the sky | any Vulkan 1.3 GPU |
-
-```java
-@Override
-protected void build() {
-    renderSettings().setRenderMode("hybrid");   // or "path", "raster"
-    ...
-}
-```
-
-In a scene file it is `"renderMode": "hybrid"` in `settings`. GPUs without hardware ray tracing always use `raster`.
+The kajiya pipeline needs hardware ray tracing (RTX 20+/RX 6000+) for the full image. Without it only the rasterized G-buffer, the sun and the sky are lit. The former render modes (`hybrid`, `path`, `raster`) and their settings are accepted but ignored; temporal accumulation, `sampleLimit`, lens flares, overscan and the old debug views no longer exist.
 
 | JVM option | Effect |
 | --- | --- |
 | `-Dlumvex.gpu=<part of the name>` | picks a GPU, e.g. `-Dlumvex.gpu=intel` for the integrated one |
-| `-Dlumvex.noraytracing=true` | ignores ray tracing hardware: raster mode on any GPU |
-| `-Dlumvex.gputimes=true` | prints the GPU time of the passes |
+| `-Dlumvex.noraytracing=true` | ignores ray tracing hardware |
+| `-Dlumvex.gputimes=true` | prints the GPU frame time every 120 frames |
+| `-Dlumvex.validation=true` | enables the Vulkan validation layer |
+| `-Dlumvex.dxc=true` | recompiles the HLSL shaders with `dxc` from the Vulkan SDK instead of loading the shipped SPIR-V |
+| `-Dlumvex.autoshot=<file>` (`.autoshotFrame=N`, `.autoshotExit=true`) | saves a screenshot after N frames |
 
 
 
-## Working with Assets
+
 
 By default, assets are loaded relative to the `assets/` directory in your working folder:
 
@@ -154,14 +139,28 @@ src/main/java/dev/lumvex/
                   Vulkan backend, virtual texturing, ray tracing & UI rendering
 ```
 
+*Note: Code marked with `//DEV` has been tested and works, but has not been commented yet.*
+
+## Credits
+
+The renderer is a Java port of **[kajiya](https://github.com/EmbarkStudios/kajiya)** by Embark Studios (Copyright (c) 2019 Embark Studios, dual-licensed under MIT OR Apache-2.0). The Java code in `dev.lumvex.kajiya` was rewritten from kajiya's Rust code, and the HLSL shaders in `src/main/resources/kajiya/shaders` were taken from kajiya (some of them adapted).
+
+kajiya itself ships third-party code that is also included here:
+- AMD FidelityFX Shadow Denoiser (MIT)
+- [MinimalAtmosphere](https://github.com/Fewes/MinimalAtmosphere) by Felix Westin (MIT)
+- Blue noise textures by Christoph Peters (CC0)
+- Sampler tables from [blue-noise-sampler](https://github.com/Jasper-Bekkers/blue-noise-sampler)
+
+Full details and license texts: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and [`licenses/`](licenses).
+
+Thank you to Embark Studios and all kajiya contributors!
+
 ## AI Disclosure
 
-I used AI tools for:
-- writing parts of the documentation/wiki
-- reviewing the code comments (suggestions only, the AI did not change any files)
+In the early stages of the project I used AI tools for refactoring and for writing code comments. I no longer use AI tools for this, except for help with the license/credits documentation.
 
-The entire core design of the engine, the Vulkan/rendering pipelines, and the runtime systems were developed and reviewed by human developers (it's just me, so blame me if something doesn't work)
+The core design of the engine and the runtime systems were developed and reviewed by human developers (it's just me, so blame me if something doesn't work). Starting with version 1.3.0, the render pipelines contain code from [kajiya](https://github.com/EmbarkStudios/kajiya) (ported from Rust to Java, shaders taken over), see [Credits](#credits).
 
 ## License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). Third-party code (kajiya and others) keeps its own license, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
