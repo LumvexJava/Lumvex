@@ -34,7 +34,7 @@ public final class AssetCache implements AutoCloseable {
     public Project project() { return project; }
 
     public void prefetchModel(String id) {
-        models.computeIfAbsent(id, k -> pool.submit(() -> GltfLoader.load(project.asset(k), project.modelTextureSize, 0)));
+        models.computeIfAbsent(id, k -> pool.submit(() -> GltfLoader.load(project.asset(k), k.replace(java.io.File.separatorChar, '/').contains("glb/") ? Math.min(project.modelTextureSize, Integer.getInteger("lumvex.furnituretex", 256)) : project.modelTextureSize, 0)));
     }
 
     public void prefetchTextures(String id) {
