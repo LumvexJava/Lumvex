@@ -110,7 +110,16 @@ public final class GltfLoader {
                 mat = new Material(new Vector3f(base[0], base[1], base[2]), rough, metal,
                         new Vector3f(emissive[0], emissive[1], emissive[2]).mul(emissiveStrength), 1.5f, 0f, 0f);
             }
-            boolean isEmissive = emissive[0] + emissive[1] + emissive[2] > 0;
+            if (name.toLowerCase().startsWith("glass")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 4); //DEV
+            else if (name.toLowerCase().startsWith("viewmodel")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 16); //DEV: first-person arms, raster only
+            else if (name.toLowerCase().startsWith("int ") || name.toLowerCase().startsWith("iprop ")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 256); //DEV: interior, culled by distance
+            else if (name.toLowerCase().startsWith("prop3 ")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 512); //DEV: impostor billboards for far props
+            else if (name.toLowerCase().startsWith("prop1 ")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 64); //DEV: prop LOD 1
+            else if (name.toLowerCase().startsWith("prop2 ")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 128); //DEV: prop LOD 2
+            else if (name.toLowerCase().startsWith("prop ")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 32); //DEV: baked props, distance culled
+            else if (name.toLowerCase().startsWith("decal")) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 8); //DEV
+            if (!Boolean.getBoolean("lumvex.nointeriorflag") && file.toString().replace(java.io.File.separatorChar, '/').contains("glb/") && (mat.flags() & 4) == 0) mat = new Material(mat.albedo(), mat.roughness(), mat.metallic(), mat.emission(), 1.5f, 0f, 0f, mat.textureSet(), mat.uvScale(), mat.normalStrength(), 256); //DEV: furniture files are instanced and only drawn near the camera
+            boolean isEmissive = emissive[0] + emissive[1] + emissive[2] > 0 && !file.toString().replace(java.io.File.separatorChar, '/').contains("glb/"); //DEV: furniture never turns into point lights
             int ts = mat.textureSet() - textureSetBase;
             boolean cutout = masked && ts >= 0 && ts < sets.size() && sets.get(ts).alphaMask != null;
             materials.add(new ModelMaterial(name, mat, isEmissive, masked, cutout));

@@ -225,7 +225,8 @@ public final class VkContext implements AutoCloseable {
                     .shaderBufferFloat32AtomicAdd(atomicFloatAddSupported);
             VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtFeatures = VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack)
                     .sType$Default()
-                    .rayTracingPipeline(true);
+                    .rayTracingPipeline(true)
+                    .rayTracingPipelineTraceRaysIndirect(true); //DEV
             if (atomicFloatAddSupported) rtFeatures.pNext(atomicFeatures.address());
             VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT reorderFeatures = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack)
                     .sType$Default()
@@ -253,13 +254,22 @@ public final class VkContext implements AutoCloseable {
                     .descriptorIndexing(true)
                     .runtimeDescriptorArray(true)
                     .shaderSampledImageArrayNonUniformIndexing(true)
+                    .descriptorBindingPartiallyBound(true) //DEV
+                    .descriptorBindingVariableDescriptorCount(true) //DEV
+                    .descriptorBindingSampledImageUpdateAfterBind(true) //DEV
+                    .descriptorBindingUpdateUnusedWhilePending(true) //DEV
+                    .shaderStorageImageArrayNonUniformIndexing(true) //DEV
                     .pNext(v13.address());
             VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                     .sType$Default()
                     .pNext(v12.address());
             features2.features().shaderInt64(shaderInt64Supported).textureCompressionBC(textureCompressionBC)
                     .multiDrawIndirect(true).drawIndirectFirstInstance(true)
-                    .geometryShader(supported.geometryShader());
+                    .geometryShader(supported.geometryShader())
+                    .shaderStorageImageWriteWithoutFormat(supported.shaderStorageImageWriteWithoutFormat()) //DEV
+                    .shaderStorageImageReadWithoutFormat(supported.shaderStorageImageReadWithoutFormat()) //DEV
+                    .shaderImageGatherExtended(supported.shaderImageGatherExtended()) //DEV
+                    .samplerAnisotropy(supported.samplerAnisotropy()); //DEV
 
             VkDeviceQueueCreateInfo.Buffer queueInfo = VkDeviceQueueCreateInfo.calloc(1, stack);
             queueInfo.get(0)
